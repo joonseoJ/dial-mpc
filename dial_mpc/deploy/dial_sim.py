@@ -1,5 +1,7 @@
 import os
 import time
+import io
+import threading
 from multiprocessing import shared_memory
 from dataclasses import dataclass
 import importlib
@@ -8,12 +10,14 @@ import sys
 import yaml
 import argparse
 import numpy as np
+from PIL import Image
 import matplotlib.pyplot as plt
 import scienceplots
 import art
 
 import mujoco
 import mujoco.viewer
+from flask import Flask, Response
 
 from dial_mpc.config.base_env_config import BaseEnvConfig
 from dial_mpc.core.dial_config import DialConfig
@@ -37,6 +41,12 @@ class DialSimConfig:
     real_time_factor: float
     sim_dt: float
     sync_mode: bool
+    reward_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    web_viewer_port: int = 0
+    web_viewer_host: str = "127.0.0.1"
+    web_viewer_width: int = 640
+    web_viewer_height: int = 360
+    web_viewer_fps: float = 20.0
 
 
 class DialSim:
@@ -58,11 +68,30 @@ class DialSim:
         self.t = 0.0
         self.sync_mode = sim_config.sync_mode
         self.leg_control = sim_config.sim_leg_control
+        self.control_kp = np.asarray(env_config.kp, dtype=np.float64)
+        self.control_kd = np.asarray(env_config.kd, dtype=np.float64)
+        self.web_viewer_port = sim_config.web_viewer_port
+        self.web_viewer_host = sim_config.web_viewer_host
+        self.web_viewer_width = sim_config.web_viewer_width
+        self.web_viewer_height = sim_config.web_viewer_height
+        self.web_viewer_period = 1.0 / sim_config.web_viewer_fps
+        self._last_web_frame_time = -np.inf
+        self._web_frame = None
+        self._web_frame_condition = threading.Condition()
         self.mj_model = mujoco.MjModel.from_xml_path(
             get_model_path(sim_config.robot_name, sim_config.scene_name).as_posix()
         )
         self.mj_model.opt.timestep = self.sim_dt
         self.mj_data = mujoco.MjData(self.mj_model)
+        self.web_camera = mujoco.MjvCamera()
+        mujoco.mjv_defaultCamera(self.web_camera)
+        self.web_camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        self.web_camera.trackbodyid = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "base"
+        )
+        self.web_camera.distance = 3.0
+        self.web_camera.azimuth = 90.0
+        self.web_camera.elevation = -20.0
         self.q_history = np.zeros((self.n_acts, self.mj_model.nu))
         self.qref_history = np.zeros((self.n_acts, self.mj_model.nu))
         self.n_plot_joint = 4
@@ -122,6 +151,119 @@ class DialSim:
             (self.n_acts, self.mj_model.nu), dtype=np.float32, buffer=self.tau_shm.buf
         )
 
+        # Runtime-adjustable Go2 objective weights shared with the planner and
+        # the optional browser control panel.
+        self.reward_weights_shm = shared_memory.SharedMemory(
+            name="dial_reward_weights",
+            create=True,
+            size=3 * np.dtype(np.float32).itemsize,
+        )
+        self.reward_weights_shared = np.ndarray(
+            (3,), dtype=np.float32, buffer=self.reward_weights_shm.buf
+        )
+        self.reward_weights_shared[:] = np.asarray(
+            sim_config.reward_weights, dtype=np.float32
+        )
+        self.reset_shm = shared_memory.SharedMemory(
+            name="dial_reset_counter",
+            create=True,
+            size=2 * np.dtype(np.uint64).itemsize,
+        )
+        self.reset_shared = np.ndarray(
+            (2,), dtype=np.uint64, buffer=self.reset_shm.buf
+        )
+        self.reset_shared[:] = 0
+        self._last_reset_counter = 0
+
+    def _joint_target_torque(self, joint_target):
+        """Evaluates the same joint-target PD law as ``BaseEnv.act2tau``."""
+
+        joint_pos = self.mj_data.qpos[7 : 7 + self.Nu]
+        joint_vel = self.mj_data.qvel[6 : 6 + self.Nu]
+        torque = self.control_kp * (joint_target - joint_pos)
+        torque -= self.control_kd * joint_vel
+        return np.clip(
+            torque,
+            self.mj_model.actuator_ctrlrange[:, 0],
+            self.mj_model.actuator_ctrlrange[:, 1],
+        )
+
+    def _reset_simulation(self):
+        """Restore the initial pose and discard the currently buffered plan."""
+
+        mujoco.mj_resetDataKeyframe(self.mj_model, self.mj_data, 0)
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        self.t = 0.0
+        self.time_shared[0] = 0.0
+        self.state_shared[:] = np.concatenate(
+            [self.mj_data.qpos, self.mj_data.qvel]
+        )
+        self.acts_shared[:] = self.default_u
+        self.tau_shared[:] = 0.0
+        self.refs_shared[:] = 0.0
+        self.plan_time_shared[0] = -self.ctrl_dt
+        self.q_history[:] = 0.0
+        self.qref_history[:] = 0.0
+        print("[INFO] Simulation reset to the home keyframe")
+
+    def _start_web_viewer(self):
+        app = Flask("dial_mpc_live_viewer")
+
+        @app.get("/")
+        def index():
+            return (
+                "<!doctype html><title>DIAL-MPC live viewer</title>"
+                "<style>body{margin:0;background:#111}img{width:100vw;height:100vh;"
+                "object-fit:contain}</style><img src='/stream.mjpg'>"
+            )
+
+        @app.get("/stream.mjpg")
+        def stream():
+            def frames():
+                previous = None
+                while True:
+                    with self._web_frame_condition:
+                        self._web_frame_condition.wait_for(
+                            lambda: self._web_frame is not None
+                            and self._web_frame is not previous
+                        )
+                        previous = self._web_frame
+                    yield (
+                        b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+                        + previous
+                        + b"\r\n"
+                    )
+
+            return Response(
+                frames(), mimetype="multipart/x-mixed-replace; boundary=frame"
+            )
+
+        thread = threading.Thread(
+            target=lambda: app.run(
+                host=self.web_viewer_host,
+                port=self.web_viewer_port,
+                threaded=True,
+                use_reloader=False,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _update_visualization(self, viewer, renderer):
+        if viewer is not None:
+            viewer.sync()
+            return
+        if self.t - self._last_web_frame_time < self.web_viewer_period:
+            return
+        renderer.update_scene(self.mj_data, camera=self.web_camera)
+        pixels = renderer.render()
+        output = io.BytesIO()
+        Image.fromarray(pixels).save(output, format="JPEG", quality=85)
+        with self._web_frame_condition:
+            self._web_frame = output.getvalue()
+            self._web_frame_condition.notify_all()
+        self._last_web_frame_time = self.t
+
     def main_loop(self):
         if self.plot:
             fig, axs = plt.subplots(self.n_plot_joint, 1, figsize=(12, 12))
@@ -153,30 +295,52 @@ class DialSim:
             # show figure
             plt.show(block=False)
 
-        viewer = mujoco.viewer.launch_passive(
-            self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
-        )
+        viewer = None
+        renderer = None
+        if self.web_viewer_port:
+            renderer = mujoco.Renderer(
+                self.mj_model,
+                height=self.web_viewer_height,
+                width=self.web_viewer_width,
+            )
+            self._start_web_viewer()
+            self._update_visualization(viewer, renderer)
+        else:
+            viewer = mujoco.viewer.launch_passive(
+                self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
+            )
 
-        cnt = 0
-        viewer.user_scn.ngeom = 0
-        for i in range(self.n_acts - 1):
-            # iterate over all geoms
-            for j in range(self.mj_model.nu):
-                color = np.array(
-                    [1.0 * i / (self.n_acts - 1), 1.0 * j / self.mj_model.nu, 0.0, 1.0]
-                )
-                mujoco.mjv_initGeom(
-                    viewer.user_scn.geoms[cnt],
-                    type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-                    size=np.zeros(3),
-                    rgba=color,
-                    pos=self.refs_shared[i, j, :],
-                    mat=np.eye(3).flatten(),
-                )
-                cnt += 1
-        viewer.user_scn.ngeom = cnt
-        viewer.sync()
+            cnt = 0
+            viewer.user_scn.ngeom = 0
+            for i in range(self.n_acts - 1):
+                for j in range(self.mj_model.nu):
+                    color = np.array(
+                        [
+                            1.0 * i / (self.n_acts - 1),
+                            1.0 * j / self.mj_model.nu,
+                            0.0,
+                            1.0,
+                        ]
+                    )
+                    mujoco.mjv_initGeom(
+                        viewer.user_scn.geoms[cnt],
+                        type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+                        size=np.zeros(3),
+                        rgba=color,
+                        pos=self.refs_shared[i, j, :],
+                        mat=np.eye(3).flatten(),
+                    )
+                    cnt += 1
+            viewer.user_scn.ngeom = cnt
+            viewer.sync()
         while True:
+            reset_counter = int(self.reset_shared[0])
+            if reset_counter != self._last_reset_counter:
+                self._reset_simulation()
+                self._last_reset_counter = reset_counter
+                # Publish completion only after state, time, and action buffers
+                # all contain their reset values.
+                self.reset_shared[1] = reset_counter
             if self.plot:
                 # plot self.acts_shared
                 for j in range(self.n_plot_joint):
@@ -184,24 +348,26 @@ class DialSim:
                     handles[j].set_ydata(self.acts_shared[:, j])
                     handles_ref[j].set_ydata(self.qref_history[:, j])
                 plt.pause(0.001)
-            # update geoms according to the reference
-            for i in range(self.n_acts - 1):
-                for j in range(self.mj_model.nu):
-                    r0 = self.refs_shared[i, j, :]
-                    r1 = self.refs_shared[i + 1, j, :]
-                    mujoco.mjv_connector(
-                        viewer.user_scn.geoms[i * self.mj_model.nu + j],
-                        mujoco.mjtGeom.mjGEOM_CAPSULE,
-                        0.02,
-                        r0,
-                        r1,
-                    )
+            if viewer is not None:
+                for i in range(self.n_acts - 1):
+                    for j in range(self.mj_model.nu):
+                        r0 = self.refs_shared[i, j, :]
+                        r1 = self.refs_shared[i + 1, j, :]
+                        mujoco.mjv_connector(
+                            viewer.user_scn.geoms[i * self.mj_model.nu + j],
+                            mujoco.mjtGeom.mjGEOM_CAPSULE,
+                            0.02,
+                            r0,
+                            r1,
+                        )
             if self.sync_mode:
                 while self.t <= (self.plan_time_shared[0] + self.ctrl_dt):
                     if self.leg_control == "position":
                         self.mj_data.ctrl = self.acts_shared[0]
                     elif self.leg_control == "torque":
-                        self.mj_data.ctrl = self.tau_shared[0]
+                        self.mj_data.ctrl = self._joint_target_torque(
+                            self.acts_shared[0]
+                        )
                     if self.record:
                         self.data.append(
                             np.concatenate(
@@ -225,7 +391,7 @@ class DialSim:
                 self.q_history[-1, :] = q[7:]
                 self.qref_history = np.roll(self.qref_history, -1, axis=0)
                 self.qref_history[-1, :] = self.mj_data.ctrl
-                viewer.sync()
+                self._update_visualization(viewer, renderer)
             else:
                 t0 = time.time()
                 if self.plan_time_shared[0] < 0.0:
@@ -241,7 +407,9 @@ class DialSim:
                 if self.leg_control == "position":
                     self.mj_data.ctrl = self.acts_shared[delta_step]
                 elif self.leg_control == "torque":
-                    self.mj_data.ctrl = self.tau_shared[delta_step]
+                    self.mj_data.ctrl = self._joint_target_torque(
+                        self.acts_shared[delta_step]
+                    )
                 if self.record:
                     self.data.append(
                         np.concatenate(
@@ -267,7 +435,7 @@ class DialSim:
                 self.q_history[-1, :] = q[7:]
                 self.qref_history = np.roll(self.qref_history, -1, axis=0)
                 self.qref_history[-1, :] = self.mj_data.ctrl
-                viewer.sync()
+                self._update_visualization(viewer, renderer)
                 t1 = time.time()
                 duration = t1 - t0
                 if duration < self.sim_dt / self.real_time_factor:
@@ -276,18 +444,23 @@ class DialSim:
                     print("[WARN] Sim loop overruns")
 
     def close(self):
-        self.time_shm.close()
-        self.time_shm.unlink()
-        self.state_shm.close()
-        self.state_shm.unlink()
-        self.acts_shm.close()
-        self.acts_shm.unlink()
-        self.plan_time_shm.close()
-        self.plan_time_shm.unlink()
-        self.refs_shm.close()
-        self.refs_shm.unlink()
-        self.tau_shm.close()
-        self.tau_shm.unlink()
+        for shm in (
+            self.time_shm,
+            self.state_shm,
+            self.acts_shm,
+            self.plan_time_shm,
+            self.refs_shm,
+            self.tau_shm,
+            self.reward_weights_shm,
+            self.reset_shm,
+        ):
+            shm.close()
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                # An older observer may already have removed the name.  The
+                # mapping is still released correctly when this owner exits.
+                pass
 
 
 def main(args=None):
@@ -314,6 +487,12 @@ def main(args=None):
         default=None,
         help="Custom environment to import dynamically",
     )
+    parser.add_argument(
+        "--web-viewer-port",
+        type=int,
+        default=None,
+        help="Serve a headless MJPEG viewer on this port instead of opening a window",
+    )
     args = parser.parse_args(args)
 
     if args.custom_env is not None:
@@ -335,6 +514,8 @@ def main(args=None):
     else:
         config_dict = yaml.safe_load(open(args.config, "r"))
     sim_config = load_dataclass_from_dict(DialSimConfig, config_dict)
+    if args.web_viewer_port is not None:
+        sim_config.web_viewer_port = args.web_viewer_port
     env_config = load_dataclass_from_dict(BaseEnvConfig, config_dict)
     dial_config = load_dataclass_from_dict(DialConfig, config_dict)
     mujoco_env = DialSim(sim_config, env_config, dial_config)

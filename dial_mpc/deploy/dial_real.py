@@ -73,6 +73,11 @@ class DialReal:
         # control related
         self.kp = real_config.real_kp
         self.kd = real_config.real_kd
+        # These are the gains used by the rollout model.  In torque mode the
+        # target-to-torque conversion must be evaluated against the latest
+        # measured joint state, not once in the slower planner process.
+        self.control_kp = np.asarray(env_config.kp, dtype=np.float64)
+        self.control_kd = np.asarray(env_config.kd, dtype=np.float64)
         self.current_kp = 0.0
         self.mocap_odom = None
         self.ctrl_dt = env_config.dt
@@ -177,6 +182,19 @@ class DialReal:
         self.vis_thread = Thread(target=self.visualize)
         self.vis_thread.Start()
 
+    def _joint_target_torque(self, joint_target):
+        """Convert a planned target using the latest measured joint state."""
+
+        joint_pos = self.mj_data.qpos[7 : 7 + self.Nu]
+        joint_vel = self.mj_data.qvel[6 : 6 + self.Nu]
+        torque = self.control_kp * (joint_target - joint_pos)
+        torque -= self.control_kd * joint_vel
+        return np.clip(
+            torque,
+            self.mj_model.actuator_ctrlrange[:, 0],
+            self.mj_model.actuator_ctrlrange[:, 1],
+        )
+
     def visualize(self):
         while True:
             mujoco.mj_step(self.mj_model, self.mj_data)
@@ -228,7 +246,7 @@ class DialReal:
                 if delta_step >= self.n_acts or delta_step < 0:
                     delta_step = self.n_acts - 1
                 self.mj_data.ctrl = self.acts_shared[delta_step]
-                taus = self.tau_shared[delta_step].copy()
+                taus = self._joint_target_torque(self.mj_data.ctrl)
 
                 # mujoco.mj_step(self.mj_model, self.mj_data)
                 self.t += self.low_cmd_pub_dt

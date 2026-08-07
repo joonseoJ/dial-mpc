@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 import time
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 import importlib
 import sys
 
@@ -27,7 +27,7 @@ from jax_cosmo.scipy.interpolate import InterpolatedUnivariateSpline
 from brax.base import Contact, Motion, System, Transform
 
 import dial_mpc.envs as dial_envs
-from dial_mpc.core.dial_core import DialConfig, MBDPI
+from dial_mpc.core.dial_core import DialConfig, make_controller
 from dial_mpc.envs.base_env import BaseEnv, BaseEnvConfig
 from dial_mpc.utils.io_utils import (
     load_dataclass_from_dict,
@@ -42,6 +42,14 @@ xla_flags += " --xla_gpu_triton_gemm_any=True"
 os.environ["XLA_FLAGS"] = xla_flags
 
 
+def _attach_shared_memory(name: str, *, size: int | None = None):
+    """Attach without letting this observer unlink simulator-owned memory."""
+
+    shm = shared_memory.SharedMemory(name=name, create=False, size=size or 0)
+    resource_tracker.unregister(shm._name, "shared_memory")
+    return shm
+
+
 def pipeline_init(
     sys: System,
     q: jax.Array,
@@ -49,6 +57,7 @@ def pipeline_init(
 ) -> MjxState:
     data = mjx.make_data(sys)
     data = data.replace(qpos=q, qvel=qd)
+    data = mjx.forward(sys, data)
 
     q, qd = data.qpos, data.qvel
     x = Transform(pos=data.xpos[1:], rot=data.xquat[1:])
@@ -57,8 +66,9 @@ def pipeline_init(
     offset = Transform.create(pos=offset)
     xd = offset.vmap().do(cvel)
 
-    data = _reformat_contact(sys, data)
-    return MjxState(q=q, qd=qd, x=x, xd=xd, **data.__dict__)
+    data_args = data.__dict__
+    data_args["contact"] = _reformat_contact(sys, data.contact)
+    return MjxState(q=q, qd=qd, x=x, xd=xd, **data_args)
 
 
 class MBDPublisher:
@@ -71,16 +81,19 @@ class MBDPublisher:
         self.env = env
         self.env_config = env_config
 
-        self.mbdpi = MBDPI(self.dial_config, self.env)
+        self.mbdpi = make_controller(self.dial_config, self.env)
         self.rng = jax.random.PRNGKey(seed=self.dial_config.seed)
         self.pipeline_init_jit = jax.jit(pipeline_init)
         self.shift_vmap = jax.jit(jax.vmap(self.shift, in_axes=(1, None), out_axes=1))
 
         # control parameters
         self.Y = jnp.zeros([self.dial_config.Hnode + 1, self.mbdpi.nu])
-        self.ctrl_dt = env_config.dt
+        self.action_history = jnp.zeros(
+            (self.dial_config.tc_history_length, self.mbdpi.nu)
+        )
 
         # parameters
+        self.ctrl_dt = env_config.dt
         self.timer_period = env_config.dt  # seconds
         self.n_acts = self.dial_config.Hsample + 1  # action buffer size
         self.nx = self.env.sys.mj_model.nq + self.env.sys.mj_model.nv
@@ -89,15 +102,15 @@ class MBDPublisher:
         self.default_u = self.env.sys.mj_model.keyframe("home").ctrl
 
         # publisher
-        self.acts_shm = shared_memory.SharedMemory(
-            name="acts_shm", create=False, size=self.n_acts * self.nu * 32
+        self.acts_shm = _attach_shared_memory(
+            "acts_shm", size=self.n_acts * self.nu * 32
         )
         self.acts_shared = np.ndarray(
             (self.n_acts, self.nu), dtype=np.float32, buffer=self.acts_shm.buf
         )
         self.acts_shared[:] = self.default_u
-        self.refs_shm = shared_memory.SharedMemory(
-            name="refs_shm", create=False, size=self.n_acts * self.env.sys.nu * 3 * 32
+        self.refs_shm = _attach_shared_memory(
+            "refs_shm", size=self.n_acts * self.env.sys.nu * 3 * 32
         )
         self.refs_shared = np.ndarray(
             (self.n_acts, self.env.sys.nu, 3),
@@ -105,33 +118,50 @@ class MBDPublisher:
             buffer=self.refs_shm.buf,
         )
         self.refs_shared[:] = 1.0
-        self.plan_time_shm = shared_memory.SharedMemory(
-            name="plan_time_shm", create=False, size=32
-        )
+        self.plan_time_shm = _attach_shared_memory("plan_time_shm", size=32)
         self.plan_time_shared = np.ndarray(
             1, dtype=np.float32, buffer=self.plan_time_shm.buf
         )
         self.plan_time_shared[0] = -0.02
         # listerner
-        self.time_shm = shared_memory.SharedMemory(
-            name="time_shm", create=False, size=32
-        )
+        self.time_shm = _attach_shared_memory("time_shm", size=32)
         self.time_shared = np.ndarray(1, dtype=np.float32, buffer=self.time_shm.buf)
         self.time_shared[0] = 0.0
-        self.state_shm = shared_memory.SharedMemory(
-            name="state_shm", create=False, size=self.nx * 32
-        )
+        self.state_shm = _attach_shared_memory("state_shm", size=self.nx * 32)
         self.state_shared = np.ndarray(
             (self.nx,), dtype=np.float32, buffer=self.state_shm.buf
         )
         self.state_shared[: self.default_q.shape[0]] = self.default_q
 
-        self.tau_shm = shared_memory.SharedMemory(
-            name="tau_shm", create=False, size=self.n_acts * self.nu * 32
+        self.tau_shm = _attach_shared_memory(
+            "tau_shm", size=self.n_acts * self.nu * 32
         )
         self.tau_shared = np.ndarray(
             (self.n_acts, self.nu), dtype=np.float32, buffer=self.tau_shm.buf
         )
+        try:
+            self.reward_weights_shm = _attach_shared_memory(
+                "dial_reward_weights"
+            )
+            self.reward_weights_shared = np.ndarray(
+                (3,), dtype=np.float32, buffer=self.reward_weights_shm.buf
+            )
+        except FileNotFoundError:
+            self.reward_weights_shm = None
+            self.reward_weights_shared = np.asarray(
+                getattr(env_config, "reward_weights", (1.0, 1.0, 1.0)),
+                dtype=np.float32,
+            )
+        try:
+            self.reset_shm = _attach_shared_memory("dial_reset_counter")
+            self.reset_shared = np.ndarray(
+                (2,), dtype=np.uint64, buffer=self.reset_shm.buf
+            )
+            self._last_reset_counter = int(self.reset_shared[0])
+        except FileNotFoundError:
+            self.reset_shm = None
+            self.reset_shared = np.zeros((2,), dtype=np.uint64)
+            self._last_reset_counter = 0
 
     def shift(self, x, shift_time):
         spline = InterpolatedUnivariateSpline(self.mbdpi.step_nodes, x, k=2)
@@ -139,7 +169,9 @@ class MBDPublisher:
         return x_new
 
     def init_mjx_state(self, q, qd, t):
-        state = self.env.reset(jax.random.PRNGKey(0))
+        if not hasattr(self, "_reset_template"):
+            self._reset_template = self.env.reset(jax.random.PRNGKey(0))
+        state = self._reset_template.replace(info=dict(self._reset_template.info))
         pipeline_state = self.pipeline_init_jit(self.env.sys, q, qd)
         obs = self.env._get_obs(pipeline_state, state.info)
         state = state.replace(pipeline_state=pipeline_state, obs=obs)
@@ -149,17 +181,39 @@ class MBDPublisher:
     def update_mjx_state(self, state, q, qd, t):
         pipeline_state = state.pipeline_state.replace(qpos=q, qvel=qd)
         step = int(t / self.ctrl_dt)
-        info = state.info
+        info = dict(state.info)
         info["step"] = step
+        if "reward_weights" in info:
+            info["reward_weights"] = jnp.asarray(
+                self.reward_weights_shared.copy()
+            )
         state = state.replace(pipeline_state=pipeline_state, info=info)
         return state
+
+    def close(self):
+        """Close this process's shared-memory handles."""
+
+        for shm in (
+            self.acts_shm,
+            self.refs_shm,
+            self.plan_time_shm,
+            self.time_shm,
+            self.state_shm,
+            self.tau_shm,
+            self.reward_weights_shm,
+            self.reset_shm,
+        ):
+            if shm is not None:
+                shm.close()
 
     def main_loop(self):
 
         def reverse_scan(rng_Y0_state, factor):
-            rng, Y0, state = rng_Y0_state
-            rng, Y0, info = self.mbdpi.reverse_once(state, rng, Y0, factor)
-            return (rng, Y0, state), info
+            rng, Y0, state, history = rng_Y0_state
+            rng, Y0, info = self.mbdpi.reverse_once(
+                state, rng, Y0, factor, history
+            )
+            return (rng, Y0, state, history), info
 
         last_plan_time = self.time_shared[0]
         state = self.init_mjx_state(
@@ -171,8 +225,26 @@ class MBDPublisher:
         first_time = True
         while True:
             t0 = time.time()
-            # get state
+            reset_counter = int(self.reset_shared[0])
+            if reset_counter != self._last_reset_counter:
+                # Do not publish a plan from the pre-reset timeline.  The
+                # simulator acknowledges only after resetting all buffers.
+                if int(self.reset_shared[1]) != reset_counter:
+                    time.sleep(0.001)
+                    continue
+            # Read time and state only after the reset acknowledgement.
             plan_time = self.time_shared[0]
+            if reset_counter != self._last_reset_counter:
+                self.Y = jnp.zeros_like(self.Y)
+                self.action_history = jnp.zeros_like(self.action_history)
+                last_plan_time = plan_time
+                state = self.init_mjx_state(
+                    self.state_shared[: self.env.sys.mj_model.nq].copy(),
+                    self.state_shared[self.env.sys.mj_model.nq :].copy(),
+                    plan_time.copy(),
+                )
+                self._last_reset_counter = reset_counter
+                print("[INFO] Planner reset")
             state = self.update_mjx_state(
                 state,
                 self.state_shared[: self.env.sys.mj_model.nq],
@@ -180,6 +252,9 @@ class MBDPublisher:
                 plan_time,
             )
             # shift Y
+            self.action_history = jnp.concatenate(
+                [self.action_history[1:], self.Y[0][None]], axis=0
+            )
             shift_time = plan_time - last_plan_time
             if shift_time > self.ctrl_dt + 1e-3:
                 print(f"[WRAN] sim overtime {(shift_time-self.ctrl_dt)*1000:.1f} ms")
@@ -197,18 +272,25 @@ class MBDPublisher:
                 n_diffuse = self.dial_config.Ndiffuse_init
                 first_time = False
                 traj_diffuse_factors = (
-                    self.dial_config.traj_diffuse_factor
+                    self.mbdpi.sigma_control
+                    * self.dial_config.traj_diffuse_factor
                     ** (jnp.arange(n_diffuse))[:, None]
                 )
-                (self.rng, self.Y, _), info = jax.lax.scan(
-                    reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
+                (self.rng, self.Y, _, _), info = jax.lax.scan(
+                    reverse_scan,
+                    (self.rng, self.Y, state, self.action_history),
+                    traj_diffuse_factors,
                 )
                 n_diffuse = self.dial_config.Ndiffuse
             traj_diffuse_factors = (
-                self.dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
+                self.mbdpi.sigma_control
+                * self.dial_config.traj_diffuse_factor
+                ** (jnp.arange(n_diffuse))[:, None]
             )
-            (self.rng, self.Y, _), info = jax.lax.scan(
-                reverse_scan, (self.rng, self.Y, state), traj_diffuse_factors
+            (self.rng, self.Y, _, _), info = jax.lax.scan(
+                reverse_scan,
+                (self.rng, self.Y, state, self.action_history),
+                traj_diffuse_factors,
             )
             # use position control
             actual_joint_targets = info["qbar"][:, 7:]
@@ -282,12 +364,20 @@ def main(args=None):
     )
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
 
-    mbd_publisher = MBDPublisher(env, env_config, dial_config)
+    try:
+        mbd_publisher = MBDPublisher(env, env_config, dial_config)
+    except FileNotFoundError as exc:
+        missing = getattr(exc, "filename", None) or "shared memory"
+        raise SystemExit(
+            f"{missing} is unavailable. Start dial-mpc-sim before dial-mpc-plan."
+        ) from None
 
     try:
         mbd_publisher.main_loop()
     except KeyboardInterrupt:
         pass
+    finally:
+        mbd_publisher.close()
 
 
 if __name__ == "__main__":
