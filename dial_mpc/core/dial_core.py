@@ -1,6 +1,6 @@
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib
 import sys
 
@@ -24,6 +24,7 @@ import dial_mpc.envs as dial_envs
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 from dial_mpc.examples import examples
 from dial_mpc.core.dial_config import DialConfig
+from dial_mpc.core.tc_mppi import TimeCorrelatedGaussian
 
 plt.style.use("science")
 
@@ -76,6 +77,19 @@ class MBDPI:
         self.step_nodes = jnp.linspace(0, self.ctrl_dt * args.Hsample, args.Hnode + 1)
         self.node_dt = self.ctrl_dt * (args.Hsample) / (args.Hnode)
 
+        self.tc_sampler = None
+        if args.time_correlated:
+            if args.tc_mean_mode not in ("dial", "conditional"):
+                raise ValueError(
+                    "tc_mean_mode must be either 'dial' or 'conditional'"
+                )
+            self.tc_sampler = TimeCorrelatedGaussian(
+                horizon=args.Hnode + 1,
+                history_length=args.tc_history_length,
+                dt=self.node_dt,
+                derivative_weights=args.tc_derivative_weights,
+            )
+
         # setup function
         self.rollout_us = jax.jit(functools.partial(rollout_us, self.env.step))
         self.rollout_us_vmap = jax.jit(jax.vmap(self.rollout_us, in_axes=(None, 0)))
@@ -101,17 +115,39 @@ class MBDPI:
         return nodes
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def reverse_once(self, state, rng, Ybar_i, noise_scale):
+    def reverse_once(self, state, rng, Ybar_i, noise_scale, action_history=None):
         # sample from q_i
         rng, Y0s_rng = jax.random.split(rng)
         eps_Y = jax.random.normal(
             Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
         )
-        Y0s = eps_Y * noise_scale[None, :, None] + Ybar_i
-        # we can't change the first control
-        Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
-        # append Y0s with Ybar_i to also evaluate Ybar_i
-        Y0s = jnp.concatenate([Y0s, Ybar_i[None]], axis=0)
+        prior_mean = Ybar_i
+        sampling_mean = Ybar_i
+        if self.tc_sampler is None:
+            Y0s = eps_Y * noise_scale[None, :, None] + Ybar_i
+            # Original DIAL keeps the first node fixed.
+            Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
+        else:
+            if self.args.tc_mean_mode == "conditional":
+                if action_history is None:
+                    action_history = jnp.broadcast_to(
+                        Ybar_i[0], (self.args.tc_history_length, self.nu)
+                    )
+                prior_mean, sampling_mean = self.tc_sampler.conditional_means(
+                    action_history, Ybar_i
+                )
+            correlated_noise = self.tc_sampler.transform_standard_normal(
+                eps_Y, noise_scale
+            )
+            Y0s = sampling_mean + correlated_noise
+            if self.args.tc_mean_mode == "dial":
+                # DIAL already supplies the proposal mean.  Replacing it at
+                # every annealing pass produces a large proposal/prior gap and
+                # degenerate importance weights.  Keep DIAL's mean and locked
+                # first node, changing only the temporal noise covariance.
+                Y0s = Y0s.at[:, 0].set(Ybar_i[0, :])
+        # Evaluate the center of the actual sampling distribution as well.
+        Y0s = jnp.concatenate([Y0s, sampling_mean[None]], axis=0)
         Y0s = jnp.clip(Y0s, -1.0, 1.0)
         # convert Y0s to us
         us = self.node2u_vvmap(Y0s)
@@ -123,7 +159,15 @@ class MBDPI:
         qdss = pipeline_statess.qd
         xss = pipeline_statess.x.pos
         rews = rewss.mean(axis=-1)
-        logp0 = (rews - rew_Ybar_i) / rews.std(axis=-1) / self.args.temp_sample
+        reward_scale = jnp.maximum(rews.std(axis=-1), 1e-6)
+        logp0 = (rews - rew_Ybar_i) / reward_scale / self.args.temp_sample
+        if self.tc_sampler is not None:
+            tc_log_ratio = self.tc_sampler.log_importance_ratio(
+                Y0s, prior_mean, sampling_mean, noise_scale
+            )
+            logp0 = logp0 + self.args.tc_importance_scale * tc_log_ratio
+        else:
+            tc_log_ratio = jnp.zeros_like(logp0)
 
         weights = jax.nn.softmax(logp0)
         Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
@@ -136,6 +180,15 @@ class MBDPI:
 
         info = {
             "rews": rews,
+            # Expose the exact MPPI samples and normalized Gibbs weights so
+            # downstream imitation learners can use reverse_once itself as
+            # the teacher instead of maintaining a subtly different copy.
+            "weights": weights,
+            "Y0s": Y0s,
+            "noise_scale": noise_scale,
+            "sampling_mean": sampling_mean,
+            "prior_mean": prior_mean,
+            "tc_log_importance_ratio": tc_log_ratio,
             "qbar": qbar,
             "qdbar": qdbar,
             "xbar": xbar,
@@ -172,12 +225,29 @@ class MBDPI:
         return Y
 
 
+class DIALTCMPPI(MBDPI):
+    """DIAL annealing with TC-MPPI conditional correlated sampling."""
+
+    def __init__(self, args: DialConfig, env):
+        super().__init__(replace(args, time_correlated=True), env)
+
+
+def make_controller(args: DialConfig, env):
+    """Builds the configured DIAL or DIAL-TC-MPPI controller."""
+
+    if args.time_correlated:
+        return DIALTCMPPI(args, env)
+    return MBDPI(args, env)
+
+
 def main():
 
     def reverse_scan(rng_Y0_state, factor):
-        rng, Y0, state = rng_Y0_state
-        rng, Y0, info = mbdpi.reverse_once(state, rng, Y0, factor)
-        return (rng, Y0, state), info
+        rng, Y0, state, history = rng_Y0_state
+        rng, Y0, info = mbdpi.reverse_once(
+            state, rng, Y0, factor, history
+        )
+        return (rng, Y0, state, history), info
 
     art.tprint("LeCAR @ CMU\nDIAL-MPC", font="big", chr_ignore=True)
     parser = argparse.ArgumentParser()
@@ -221,7 +291,7 @@ def main():
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
     reset_env = jax.jit(env.reset)
     step_env = jax.jit(env.step)
-    mbdpi = MBDPI(dial_config, env)
+    mbdpi = make_controller(dial_config, env)
 
     rng, rng_reset = jax.random.split(rng)
     state_init = reset_env(rng_reset)
@@ -231,6 +301,9 @@ def main():
     rng_exp, rng = jax.random.split(rng)
     # Y0 = mbdpi.reverse(state_init, YN, rng_exp)
     Y0 = YN
+    action_history = jnp.zeros(
+        (dial_config.tc_history_length, mbdpi.nu), dtype=Y0.dtype
+    )
 
     Nstep = dial_config.n_steps
     rews = []
@@ -246,6 +319,9 @@ def main():
             rollout.append(state.pipeline_state)
             rews.append(state.reward)
             us.append(Y0[0])
+            action_history = jnp.concatenate(
+                [action_history[1:], Y0[0][None]], axis=0
+            )
 
             # update Y0
             Y0 = mbdpi.shift(Y0)
@@ -259,8 +335,10 @@ def main():
             traj_diffuse_factors = (
                 mbdpi.sigma_control * dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
             )
-            (rng, Y0, _), info = jax.lax.scan(
-                reverse_scan, (rng, Y0, state), traj_diffuse_factors
+            (rng, Y0, _, _), info = jax.lax.scan(
+                reverse_scan,
+                (rng, Y0, state, action_history),
+                traj_diffuse_factors,
             )
             rews_plan.append(info["rews"][-1].mean())
             infos.append(info)

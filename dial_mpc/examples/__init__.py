@@ -3,6 +3,7 @@ examples = [
     "unitree_h1_push_crate",
     "unitree_h1_loco",
     "unitree_go2_trot",
+    "unitree_go2_trot_tc",
     "unitree_go2_seq_jump",
     "unitree_go2_crate_climb",
     "allegro_reorient",
@@ -10,6 +11,7 @@ examples = [
 
 deploy_examples = [
     "unitree_go2_trot_deploy",
+    "unitree_go2_trot_tc_deploy",
     "unitree_go2_seq_jump_deploy",
     "unitree_h1_loco_deploy",
 ]
