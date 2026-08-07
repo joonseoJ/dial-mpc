@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Sequence, Tuple, Union, List
 
 import numpy as np
@@ -31,6 +31,9 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     default_vyaw: float = 0.0
     ramp_up_time: float = 2.0
     gait: str = "trot"
+    reward_weights: jax.Array = field(
+        default_factory=lambda: jnp.array([1.0, 1.0, 1.0])
+    )
 
 
 class UnitreeGo2Env(BaseEnv):
@@ -115,6 +118,7 @@ class UnitreeGo2Env(BaseEnv):
             "randomize_target": self._config.randomize_tasks,
             "last_contact": jnp.zeros(4, dtype=jnp.bool),
             "feet_air_time": jnp.zeros(4),
+            "reward_weights": jnp.asarray(self._config.reward_weights),
         }
 
         obs = self._get_obs(pipeline_state, state_info)
@@ -217,26 +221,19 @@ class UnitreeGo2Env(BaseEnv):
         reward_height = -jnp.sum(
             (x.pos[self._torso_idx - 1, 2] - state.info["pos_tar"][2]) ** 2
         )
-        # energy reward
-        reward_energy = -jnp.sum(
-            jnp.maximum(ctrl * pipeline_state.qvel[6:] / 160.0, 0.0) ** 2
-        )
         # stay alive reward
         reward_alive = 1.0 - state.done
         # reward
-        reward = (
-            reward_gaits * 0.1
-            + reward_air_time * 0.0
-            + reward_pos * 0.0
-            + reward_upright * 0.5
-            + reward_yaw * 0.3
-            # + reward_pose * 0.0
-            + reward_vel * 1.0
-            + reward_ang_vel * 1.0
-            + reward_height * 1.0
-            + reward_energy * 0.00
-            + reward_alive * 0.0
+        # CSM-compatible objective basis.  The default weights [1, 1, 1]
+        # exactly reproduce the original Go2 trot reward.
+        reward_components = jnp.stack(
+            [
+                reward_vel + reward_ang_vel,
+                reward_upright * 0.5 + reward_yaw * 0.3 + reward_height,
+                reward_gaits * 0.1,
+            ]
         )
+        reward = jnp.dot(state.info["reward_weights"], reward_components)
 
         # done
         up = jnp.array([0.0, 0.0, 1.0])

@@ -26,3 +26,4 @@ default_vy: 0.0
 default_vyaw: 0.0
 ramp_up_time: 1.0
 gait: trot
+reward_weights: [1.0, 1.0, 1.0]

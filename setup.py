@@ -4,7 +4,9 @@ setup(
     name="dial-mpc",
     author="Haoru Xue",
     author_email="haoru-xue@berkeley.edu",
-    packages=find_packages(include=["dial_mpc"]),
+    packages=find_packages(
+        include=["dial_mpc", "dial_mpc.*", "csm", "csm.*"]
+    ),
     version="0.0.2",
     install_requires=[
         "numpy<2.0.0",
@@ -18,8 +20,17 @@ setup(
         "art",
         "emoji",
         "scienceplots",
+        "flax",
+        "optax",
+        "cloudpickle",
+        "flask",
+        "pillow",
+        "setuptools<81",
     ],
-    package_data={"dial-mpc": ["models/", "examples/"]},
+    package_data={
+        "dial_mpc": ["examples/*.yaml", "models/**/*"],
+        "csm": ["*.json"],
+    },
     entry_points={
         "console_scripts": [
             "dial-mpc=dial_mpc.core.dial_core:main",
@@ -28,6 +39,10 @@ setup(
             "dial-mpc-sim=dial_mpc.deploy.dial_sim:main",
             "dial-mpc-real=dial_mpc.deploy.dial_real:main",
             "dial-mpc-plan=dial_mpc.deploy.dial_plan:main",
+            "dial-mpc-weights=dial_mpc.deploy.dial_weights:main",
+            "dial-csm=dial_mpc.csm_entrypoint:train",
+            "dial-csm-benchmark=dial_mpc.csm_entrypoint:benchmark",
+            "dial-csm-eval=dial_mpc.csm_entrypoint:evaluate",
         ],
     },
 )

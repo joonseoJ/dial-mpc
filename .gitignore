@@ -251,4 +251,18 @@ AMENT_IGNORE
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,c++,python,ros2
 
+# DIAL-MPC generated rollout artifacts and visualization output
+/output/
+/allegro_reorient/
+/unitree_go2_crate_climb/
+/unitree_go2_seq_jump/
+/unitree_go2_trot/
+/unitree_h1_jog/
+/unitree_h1_loco/
+/unitree_h1_push_crate/
+/csm_runs/
+*_brax_visualization.html
+*_states.npy
+*_predictions.npy
+
 dial_mpc_ws/
