@@ -75,7 +75,180 @@ Run an example:
 dial-mpc --example unitree_h1_jog
 ```
 
+Run DIAL-TC-MPPI (DIAL annealing with TC-MPPI's conditional,
+time-correlated sampling distribution):
+
+```bash
+dial-mpc --example unitree_go2_trot_tc
+```
+
+The controller is selected by `time_correlated: true`.  Its main tuning
+parameters are `tc_history_length`, the `d + 1` entries in
+`tc_derivative_weights`, `tc_mean_mode`, and `tc_importance_scale`.  The
+stable default `tc_mean_mode: dial` preserves DIAL's annealed mean while
+using TC-MPPI's temporal covariance.  The original DIAL-MPC
+path remains the default.  See
+[`docs/dial_tc_mppi_ko.md`](docs/dial_tc_mppi_ko.md) for the equations and
+implementation mapping.
+
 After rollout completes, go to `127.0.0.1:5000` to visualize the rollouts.
+
+## Compositional Energy Policy
+
+The bundled `csm` package trains one scalar trajectory-energy head for each
+raw objective (`tracking`, `stability`, `gait`).  At inference it forms
+`E_omega(o,U) = omega @ E(o,U)` and performs bounded gradient descent on the
+action nodes.  This preserves zero-shot weight composition at the energy
+level; finite-sample MPPI updates are deliberately not linearly combined.
+The package is JAX/Brax-native and does not require Hydrax, GPC, Warp, or
+Torch.
+
+Run the end-to-end Go2 integration check:
+
+```bash
+dial-csm --example unitree_go2_trot --smoke
+```
+
+Run the deploy-scale collection, energy training, three query-level DAgger
+rounds, and rollout checkpoint selection:
+
+```bash
+dial-csm --example unitree_go2_trot \
+  --samples 2048 --collect-steps 400 \
+  --energy-candidates 64 --teacher-repeats 4 \
+  --train-iters 30000 --dagger-rounds 3 \
+  --dagger-steps 200 --dagger-train-iters 15000 \
+  --batch-size 256 --calibration-weight 0.1 --sobolev-weight 0.1 \
+  --energy-steps 8 --energy-step-size 1.0 --trust-radius 0.05 \
+  --minimum-mean-vx 0.5
+```
+
+Each run writes `energy_data.npz` (and the compatibility alias `scores.npz`),
+`policy.pkl`, `checkpoint_selection.json`, and `visualization.html` below
+`csm_runs/`.  These generated files are ignored by Git.
+
+Deploy-scale runs persist data and checkpoints while they are running:
+
+- `energy_data.npz` contains raw objective costs and exact-DIAL direction
+  anchors.
+- `dagger_round_N.npz` and `dagger_aggregated.npz` persist on-policy data.
+- `checkpoints/step_XXXXXX/policy.pkl` and `metadata.json` are saved every
+  5,000 gradient steps by default.
+- `run_config.json` records energy normalization and the selected rollout.
+
+Base data and each DAgger round are sampled with equal probability.  Objective
+normalization is recomputed as an equal-mixture statistic at each round; the
+energy heads are exactly reparameterized so their raw energy predictions do
+not jump when those statistics change.  Checkpoint survival credit is granted
+only to rollouts whose mean forward speed reaches `--minimum-mean-vx`.
+Every newly collected guidance query also stores the exact Brax rollout
+Jacobian `d[tracking,stability,gait]/dU`; `--sobolev-weight` matches those
+objective gradients to the corresponding energy heads.  Older NPZ datasets
+remain loadable but their missing Jacobians are masked out.
+
+### Tune Go2 expert weights live
+
+The asynchronous Go2 planner reads the three reward weights
+`tracking, stability, gait` from shared memory every MPC cycle.  On a
+headless server, start these three processes in separate terminals:
+
+The order matters: the simulator creates the shared-memory channels, so wait
+until terminal 1 prints its viewer address before starting terminals 2 and 3.
+
+```bash
+# Terminal 1: MuJoCo simulation and browser video stream
+MUJOCO_GL=egl dial-mpc-sim --example unitree_go2_trot_deploy \
+  --web-viewer-port 8081
+
+# Terminal 2: DIAL-MPC expert planner
+dial-mpc-plan --example unitree_go2_trot_deploy
+
+# Terminal 3: live sliders and candidate-matrix tools
+dial-mpc-weights --serve --port 8080
+```
+
+Forward both ports from a local machine and open `http://127.0.0.1:8080`:
+
+```bash
+ssh -N \
+  -L 8080:127.0.0.1:8080 \
+  -L 8081:127.0.0.1:8081 \
+  USER@SERVER
+```
+
+For a live DIAL-TC-MPPI simulation, use the corresponding deploy example:
+
+```bash
+# Terminal 1: simulator and browser stream
+MUJOCO_GL=egl dial-mpc-sim --example unitree_go2_trot_tc_deploy \
+  --web-viewer-port 8081
+
+# Terminal 2: DIAL-TC-MPPI planner
+dial-mpc-plan --example unitree_go2_trot_tc_deploy
+```
+
+Forward `8081` and open `http://127.0.0.1:8081` locally:
+
+```bash
+ssh -N -L 8081:127.0.0.1:8081 USER@SERVER
+```
+
+The control page embeds the live simulation, applies slider changes on the
+next planning cycle, and can save up to three candidate vectors.  It reports
+their matrix rank and condition number and stores them in
+`csm_runs/go2_weight_candidates.json`.
+
+Weights can also be inspected or changed without the browser:
+
+```bash
+dial-mpc-weights --get
+dial-mpc-weights --set 2,2,1
+```
+
+If the robot falls, use the `Reset robot` button or reset it from another
+terminal.  This restores the MuJoCo home keyframe and clears the planner's
+previous action plan together:
+
+```bash
+dial-mpc-weights --reset
+```
+
+Use the saved expert modes to cover the state distribution during energy-data
+collection.  The energy heads themselves correspond to raw objectives, not
+these three modes:
+
+```bash
+dial-csm --example unitree_go2_trot \
+  --mode-weights csm/go2_modes.json \
+  --samples 2048 --collect-steps 400 \
+  --energy-candidates 64 --teacher-repeats 4 \
+  --train-iters 30000 --batch-size 256
+```
+
+The collector calls the real DIAL `MBDPI.reverse_once`, including its reward
+standardization, temperature, clipping, and spline conversion.  Its bounded
+update is used only as an energy-gradient direction anchor; raw unweighted
+rollout costs supervise the scalar objective heads.
+
+Compare the three standard full-rank expert modes under identical seeds and
+initial conditions.  This writes JSON/CSV metrics and one rollout HTML per
+mode:
+
+```bash
+dial-csm-benchmark --example unitree_go2_trot \
+  --weights "2,2,1;2,1,2;1,2,2" --steps 300 --warmup-steps 50
+```
+
+Evaluate a saved CSM policy continuously with a real-time browser viewer:
+
+```bash
+dial-csm-eval \
+  --policy csm_runs/unitree_go2_walk-20260804-084109/policy.pkl \
+  --example unitree_go2_trot --omega 2,2,1 \
+  --steps 500 --episodes 0 --web-viewer-port 8082
+```
+
+Forward `8082` over SSH and open `http://127.0.0.1:8082` locally.
 
 ## Asynchronous Simulation
 
