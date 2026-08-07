@@ -72,11 +72,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-candidates", type=int, default=128)
     parser.add_argument("--banks-per-query", type=int, default=4)
     parser.add_argument("--train-iters", type=int, default=30_000)
-    parser.add_argument("--dagger-rounds", type=int, default=3)
+    parser.add_argument("--dagger-rounds", type=int, default=5)
     parser.add_argument("--dagger-steps", type=int, default=200)
     parser.add_argument("--dagger-train-iters", type=int, default=15_000)
     parser.add_argument(
-        "--dagger-betas", type=_parse_betas, default=(0.5, 0.25, 0.0)
+        "--dagger-betas", type=_parse_betas, default=(0.5, 0.25, 0.0, 0.0, 0.0)
     )
     parser.add_argument("--prefall-window", type=int, default=10)
     parser.add_argument("--prefall-priority", type=float, default=8.0)

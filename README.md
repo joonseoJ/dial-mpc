@@ -121,8 +121,8 @@ Run the deploy-scale pipeline with the same three anchor modes in
 dial-afgs --example unitree_go2_trot_tc \
   --samples 2048 --model-candidates 128 --banks-per-query 4 \
   --collect-steps 400 \
-  --train-iters 30000 --dagger-rounds 3 \
-  --dagger-betas 0.5,0.25,0.0 \
+  --train-iters 30000 --dagger-rounds 5 \
+  --dagger-betas 0.5,0.25,0.0,0.0,0.0 \
   --dagger-steps 200 --dagger-train-iters 15000 \
   --batch-size 128
 ```
@@ -132,9 +132,12 @@ in `gibbs_data.npz`.  No weights from the interior of the simplex are sampled
 during training.  An unseen preference `omega` is converted to anchor
 coordinates by solving `W.T @ alpha = omega`; raw costs are combined as
 `C_anchor @ alpha`.  The composed costs are centered and standardized over the
-current candidate bank exactly as in DIAL-TC-MPPI.  Base and DAgger rounds are
-sampled equally, pre-fall queries receive elevated replay priority, and the
-default DAgger curriculum is `0.5, 0.25, 0.0`.
+current candidate bank exactly as in DIAL-TC-MPPI.  The TC Go2 observation
+also includes sine/cosine gait phase, which is required to identify the raw
+gait cost.  Base and DAgger rounds are sampled equally, pre-fall queries
+receive elevated replay priority, and the default DAgger curriculum is
+`0.5, 0.25, 0.0, 0.0, 0.0`; the three pure-student rounds reduce successive
+closed-loop distribution shift.
 
 Checkpoint publication is a hard deployment gate.  A checkpoint must survive
 300 steps at at least 0.5 m/s for every anchor and every unseen validation

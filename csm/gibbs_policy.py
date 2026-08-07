@@ -86,6 +86,9 @@ class AnchorGibbsPolicy:
             -1.0,
             1.0,
         )
+        # TC-AFGS v2 appends gait phase to the Go2 observation.  Slicing keeps
+        # legacy 55-D checkpoints usable with the phase-aware environment.
+        y = y[..., : self.model.observation_size]
         observation = self.normalizer(y, use_running_average=True)
 
         def update(carry, factor):

@@ -48,8 +48,10 @@ AFGS data must use `DIALTCMPPI` proposals, random candidate banks distributed
 like deployment, and raw costs before reward standardization.  Do not use a
 shared anchor scale: it is compositional but does not reproduce true DIAL.
 Compute the unseen weight's scale from its composed costs in the current bank.
-DAgger must end with a pure-student (`beta=0`) round and prioritize queries
-immediately preceding physical falls.
+The Go2 TC example must expose sine/cosine gait phase because the raw gait
+cost is not identifiable from the phase-free observation.  DAgger must use
+multiple pure-student (`beta=0`) rounds after its mixed-policy curriculum and
+prioritize queries immediately preceding physical falls.
 
 ## DIAL integration
 
