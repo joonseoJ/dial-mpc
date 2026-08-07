@@ -103,6 +103,36 @@ level; finite-sample MPPI updates are deliberately not linearly combined.
 The package is JAX/Brax-native and does not require Hydrax, GPC, Warp, or
 Torch.
 
+For zero-shot preference composition, the recommended controller is the
+anchor-factorized Gibbs score model.  It uses DIAL-TC-MPPI's correlated
+candidate proposal, learns the clean candidate logits of only the configured
+full-rank anchor weights, composes unseen weights analytically before the
+softmax, and executes the resulting learned MPPI update without physics
+rollouts or action-gradient optimization:
+
+```bash
+dial-afgs --example unitree_go2_trot_tc --smoke
+```
+
+Run the deploy-scale pipeline with the same three anchor modes in
+`csm/go2_modes.json`:
+
+```bash
+dial-afgs --example unitree_go2_trot_tc \
+  --samples 2048 --model-candidates 64 --collect-steps 400 \
+  --train-iters 30000 --dagger-rounds 3 \
+  --dagger-steps 200 --dagger-train-iters 15000 \
+  --batch-size 128
+```
+
+AFGS stores grouped candidate sets and anchor logits in `gibbs_data.npz`.
+No weights from the interior of the simplex are sampled during training.  An
+unseen preference `omega` is converted to anchor coordinates by solving
+`W.T @ alpha = omega`; candidate logits are combined as `L @ alpha` and only
+then passed through the Gibbs softmax.  A shared per-query logit scale is
+essential: normalizing rewards separately for each anchor would destroy this
+algebraic composition.
+
 Run the end-to-end Go2 integration check:
 
 ```bash
@@ -115,7 +145,7 @@ rounds, and rollout checkpoint selection:
 ```bash
 dial-csm --example unitree_go2_trot \
   --samples 2048 --collect-steps 400 \
-  --energy-candidates 64 --teacher-repeats 4 \
+  --energy-candidates 64 --teacher-repeats 8 \
   --train-iters 30000 --dagger-rounds 3 \
   --dagger-steps 200 --dagger-train-iters 15000 \
   --batch-size 256 --calibration-weight 0.1 --sobolev-weight 0.1 \
@@ -221,7 +251,7 @@ these three modes:
 dial-csm --example unitree_go2_trot \
   --mode-weights csm/go2_modes.json \
   --samples 2048 --collect-steps 400 \
-  --energy-candidates 64 --teacher-repeats 4 \
+  --energy-candidates 64 --teacher-repeats 8 \
   --train-iters 30000 --batch-size 256
 ```
 

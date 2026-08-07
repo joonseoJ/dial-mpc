@@ -20,6 +20,12 @@ def train() -> None:
     main()
 
 
+def train_anchor_gibbs() -> None:
+    from csm.gibbs_cli import main
+
+    main()
+
+
 def benchmark() -> None:
     from csm.benchmark_experts import main
 

@@ -22,6 +22,7 @@ from PIL import Image
 
 import dial_mpc.envs as dial_envs
 from csm.energy_policy import CompositionalEnergyPolicy
+from csm.gibbs_policy import AnchorGibbsPolicy
 from csm.policy import CompositionalPolicy
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 
@@ -169,9 +170,12 @@ def main() -> None:
     )
     env = brax_envs.get_environment(config["env_name"], config=env_config)
     try:
-        policy = CompositionalEnergyPolicy.load(args.policy)
+        policy = AnchorGibbsPolicy.load(args.policy)
     except TypeError:
-        policy = CompositionalPolicy.load(args.policy)
+        try:
+            policy = CompositionalEnergyPolicy.load(args.policy)
+        except TypeError:
+            policy = CompositionalPolicy.load(args.policy)
     if args.omega is None:
         omega = jnp.asarray(policy.mode_weights[0])
     else:

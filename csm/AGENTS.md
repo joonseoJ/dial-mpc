@@ -5,7 +5,7 @@
 `csm` is a JAX/Brax-native extension of this repository.  Do not add imports
 from the prototype's former `hydrax`, `gpc`, Warp, or Torch projects.
 
-## Mathematical target
+## Mathematical targets
 
 For normalized DIAL action sequences `U` in `[-1, 1]`, data collection uses
 plain isotropic MPPI:
@@ -28,6 +28,22 @@ Compose raw scalar energies, never finite-sample MPPI bounded updates.  The
 Gibbs normalization and action clipping make the latter nonlinear in omega.
 Exact `MBDPI.reverse_once` updates are permitted only as derivative-direction
 supervision for the composed energy.
+
+The preferred zero-shot controller is the anchor-factorized Gibbs score model.
+It learns clean candidate logits at a full-rank set of anchor weights, composes
+an arbitrary preference in logit space, and only then applies the nonlinear
+Gibbs softmax:
+
+```
+W.T @ alpha = omega
+logit_omega(V) = sum_a alpha[a] * logit_anchor[a](V)
+weight(V) = softmax_V(logit_omega(V))
+U <- sum_V weight(V) * V
+```
+
+Never linearly compose normalized Gibbs weights or already-noised scores.
+AFGS data must use the proposal of `DIALTCMPPI` and a scale shared across all
+anchors in a query; per-weight reward standardization breaks logit linearity.
 
 ## DIAL integration
 
