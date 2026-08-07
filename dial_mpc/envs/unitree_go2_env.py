@@ -31,6 +31,21 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     default_vyaw: float = 0.0
     ramp_up_time: float = 2.0
     gait: str = "trot"
+    command_vx_min: float = -1.5
+    command_vx_max: float = 1.5
+    command_vy_min: float = -0.5
+    command_vy_max: float = 0.5
+    command_vyaw_min: float = -1.5
+    command_vyaw_max: float = 1.5
+    command_resample_steps: int = 500
+    randomize_start_state: bool = False
+    start_xy_noise: float = 0.0
+    start_height_noise: float = 0.0
+    start_rpy_noise: float = 0.0
+    start_joint_position_noise: float = 0.0
+    start_body_linear_velocity_noise: float = 0.0
+    start_body_angular_velocity_noise: float = 0.0
+    start_joint_velocity_noise: float = 0.0
     reward_weights: jax.Array = field(
         default_factory=lambda: jnp.array([1.0, 1.0, 1.0])
     )
@@ -102,15 +117,30 @@ class UnitreeGo2Env(BaseEnv):
         return sys
 
     def reset(self, rng: jax.Array) -> State:  # pytype: disable=signature-mismatch
-        rng, key = jax.random.split(rng)
+        rng, state_rng, command_rng = jax.random.split(rng, 3)
+        qpos, qvel = self._sample_initial_state(state_rng)
+        pipeline_state = self.pipeline_init(qpos, qvel)
 
-        pipeline_state = self.pipeline_init(self._init_q, jnp.zeros(self._nv))
+        default_vel_cmd = jnp.array(
+            [self._config.default_vx, self._config.default_vy, 0.0]
+        )
+        default_ang_vel_cmd = jnp.array(
+            [0.0, 0.0, self._config.default_vyaw]
+        )
+        vel_cmd, ang_vel_cmd = jax.lax.cond(
+            jnp.asarray(self._config.randomize_tasks),
+            lambda: self.sample_command(command_rng),
+            lambda: (default_vel_cmd, default_ang_vel_cmd),
+        )
+        initial_scale = self._command_ramp_scale(0)
 
         state_info = {
             "rng": rng,
             "pos_tar": jnp.array([0.282, 0.0, 0.3]),
-            "vel_tar": jnp.array([0.0, 0.0, 0.0]),
-            "ang_vel_tar": jnp.array([0.0, 0.0, 0.0]),
+            "vel_cmd": vel_cmd,
+            "ang_vel_cmd": ang_vel_cmd,
+            "vel_tar": vel_cmd * initial_scale,
+            "ang_vel_tar": ang_vel_cmd * initial_scale,
             "yaw_tar": 0.0,
             "step": 0,
             "z_feet": jnp.zeros(4),
@@ -142,28 +172,25 @@ class UnitreeGo2Env(BaseEnv):
         # observation data
         obs = self._get_obs(pipeline_state, state.info)
 
-        # switch to new target if randomize_target is True
-        def dont_randomize():
-            return (
-                jnp.array([self._config.default_vx, self._config.default_vy, 0.0]),
-                jnp.array([0.0, 0.0, self._config.default_vyaw]),
-            )
-
-        def randomize():
-            return self.sample_command(cmd_rng)
-
-        vel_tar, ang_vel_tar = jax.lax.cond(
-            (state.info["randomize_target"]) & (state.info["step"] % 500 == 0),
-            randomize,
-            dont_randomize,
+        # Keep a sampled command until the next resampling boundary.  The old
+        # implementation returned the default command on every non-boundary
+        # step, so a randomized target survived for only one control tick.
+        resample_steps = max(int(self._config.command_resample_steps), 1)
+        should_resample = (
+            state.info["randomize_target"]
+            & (state.info["step"] > 0)
+            & (state.info["step"] % resample_steps == 0)
         )
-        state.info["vel_tar"] = jnp.minimum(
-            vel_tar * state.info["step"] * self.dt / self._config.ramp_up_time, vel_tar
+        vel_cmd, ang_vel_cmd = jax.lax.cond(
+            should_resample,
+            lambda: self.sample_command(cmd_rng),
+            lambda: (state.info["vel_cmd"], state.info["ang_vel_cmd"]),
         )
-        state.info["ang_vel_tar"] = jnp.minimum(
-            ang_vel_tar * state.info["step"] * self.dt / self._config.ramp_up_time,
-            ang_vel_tar,
-        )
+        command_scale = self._command_ramp_scale(state.info["step"])
+        state.info["vel_cmd"] = vel_cmd
+        state.info["ang_vel_cmd"] = ang_vel_cmd
+        state.info["vel_tar"] = vel_cmd * command_scale
+        state.info["ang_vel_tar"] = ang_vel_cmd * command_scale
 
         # reward
         # gaits reward
@@ -257,6 +284,63 @@ class UnitreeGo2Env(BaseEnv):
         )
         return state
 
+    def _command_ramp_scale(self, step: jax.Array | int) -> jax.Array:
+        if self._config.ramp_up_time <= 0.0:
+            return jnp.asarray(1.0)
+        return jnp.clip(
+            jnp.asarray(step) * self.dt / self._config.ramp_up_time, 0.0, 1.0
+        )
+
+    def _sample_initial_state(self, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Samples a bounded, physically plausible reset state when enabled."""
+
+        qpos = self._init_q
+        qvel = jnp.zeros(self._nv)
+        if not self._config.randomize_start_state:
+            return qpos, qvel
+
+        keys = jax.random.split(rng, 7)
+        xy_delta = jax.random.uniform(
+            keys[0], (2,), minval=-1.0, maxval=1.0
+        ) * self._config.start_xy_noise
+        height_delta = jax.random.uniform(
+            keys[1], (), minval=-1.0, maxval=1.0
+        ) * self._config.start_height_noise
+        rpy_delta = jax.random.uniform(
+            keys[2], (3,), minval=-1.0, maxval=1.0
+        ) * self._config.start_rpy_noise
+        joint_delta = jax.random.uniform(
+            keys[3], (self.action_size,), minval=-1.0, maxval=1.0
+        ) * self._config.start_joint_position_noise
+
+        qpos = qpos.at[:2].add(xy_delta)
+        qpos = qpos.at[2].add(height_delta)
+        rotation_delta = math.euler_to_quat(rpy_delta * 180.0 / jnp.pi)
+        qpos = qpos.at[3:7].set(math.quat_mul(rotation_delta, qpos[3:7]))
+        joint_margin = 1e-3
+        joints = jnp.clip(
+            qpos[7:] + joint_delta,
+            self.joint_range[:, 0] + joint_margin,
+            self.joint_range[:, 1] - joint_margin,
+        )
+        qpos = qpos.at[7:].set(joints)
+
+        qvel = qvel.at[:3].set(
+            jax.random.uniform(keys[4], (3,), minval=-1.0, maxval=1.0)
+            * self._config.start_body_linear_velocity_noise
+        )
+        qvel = qvel.at[3:6].set(
+            jax.random.uniform(keys[5], (3,), minval=-1.0, maxval=1.0)
+            * self._config.start_body_angular_velocity_noise
+        )
+        qvel = qvel.at[6:].set(
+            jax.random.uniform(
+                keys[6], (self.action_size,), minval=-1.0, maxval=1.0
+            )
+            * self._config.start_joint_velocity_noise
+        )
+        return qpos, qvel
+
     def _get_obs(
         self,
         pipeline_state: base.State,
@@ -293,22 +377,29 @@ class UnitreeGo2Env(BaseEnv):
         return super().render(trajectory, camera=camera, width=width, height=height)
 
     def sample_command(self, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
-        lin_vel_x = [-1.5, 1.5]  # min max [m/s]
-        lin_vel_y = [-0.5, 0.5]  # min max [m/s]
-        ang_vel_yaw = [-1.5, 1.5]  # min max [rad/s]
-
         _, key1, key2, key3 = jax.random.split(rng, 4)
         lin_vel_x = jax.random.uniform(
-            key1, (1,), minval=lin_vel_x[0], maxval=lin_vel_x[1]
+            key1,
+            (),
+            minval=self._config.command_vx_min,
+            maxval=self._config.command_vx_max,
         )
         lin_vel_y = jax.random.uniform(
-            key2, (1,), minval=lin_vel_y[0], maxval=lin_vel_y[1]
+            key2,
+            (),
+            minval=self._config.command_vy_min,
+            maxval=self._config.command_vy_max,
         )
         ang_vel_yaw = jax.random.uniform(
-            key3, (1,), minval=ang_vel_yaw[0], maxval=ang_vel_yaw[1]
+            key3,
+            (),
+            minval=self._config.command_vyaw_min,
+            maxval=self._config.command_vyaw_max,
         )
-        new_lin_vel_cmd = jnp.array([lin_vel_x[0], lin_vel_y[0], 0.0])
-        new_ang_vel_cmd = jnp.array([0.0, 0.0, ang_vel_yaw[0]])
+        new_lin_vel_cmd = jnp.stack([lin_vel_x, lin_vel_y, jnp.asarray(0.0)])
+        new_ang_vel_cmd = jnp.stack(
+            [jnp.asarray(0.0), jnp.asarray(0.0), ang_vel_yaw]
+        )
         return new_lin_vel_cmd, new_ang_vel_cmd
 
 

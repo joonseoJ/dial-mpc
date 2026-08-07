@@ -128,6 +128,10 @@ dial-csm --example unitree_go2_trot \
   --minimum-mean-vx 0.5
 ```
 
+For large-scale training with bounded initial-state and target-command
+randomization, use `unitree_go2_trot_randomized` and the command documented in
+[`docs/randomized_large_scale_training_ko.md`](docs/randomized_large_scale_training_ko.md).
+
 Each run writes `energy_data.npz` (and the compatibility alias `scores.npz`),
 `policy.pkl`, `checkpoint_selection.json`, and `visualization.html` below
 `csm_runs/`.  These generated files are ignored by Git.

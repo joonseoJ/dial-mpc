@@ -57,6 +57,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--samples", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--collect-steps", type=int, default=400)
+    parser.add_argument(
+        "--collection-episode-steps",
+        type=int,
+        default=0,
+        help="periodically reset collection episodes; 0 resets only after falls",
+    )
     parser.add_argument("--energy-candidates", type=int, default=64)
     parser.add_argument("--teacher-repeats", type=int, default=8)
     parser.add_argument("--train-iters", type=int, default=30_000)
@@ -73,6 +79,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--energy-step-size", type=float, default=1.0)
     parser.add_argument("--trust-radius", type=float, default=0.05)
     parser.add_argument("--minimum-mean-vx", type=float, default=0.5)
+    parser.add_argument(
+        "--selection-track-command",
+        action="store_true",
+        help="score tracking against each randomized velocity/yaw command",
+    )
     parser.add_argument("--checkpoint-every", type=int, default=5_000)
     parser.add_argument("--selection-steps", type=int, default=300)
     parser.add_argument("--selection-seeds", type=int, default=2)
@@ -91,6 +102,7 @@ def _collect_base(
     initial_factors,
     regular_factors,
     collect_steps,
+    collection_episode_steps,
     rng,
 ):
     chunks = []
@@ -109,6 +121,14 @@ def _collect_base(
     for state_idx in range(collect_steps):
         for mode_idx, omega in enumerate(mode_weights):
             state, plan = states[mode_idx], plans[mode_idx]
+            if (
+                collection_episode_steps > 0
+                and state_idx > 0
+                and state_idx % collection_episode_steps == 0
+            ):
+                rng, key = jax.random.split(rng)
+                state = _set_mode(reset(key), omega)
+                plan = jnp.zeros_like(plan)
             state = step(_set_mode(state, omega), plan[0])
             state.reward.block_until_ready()
             if _physically_fallen(env, state):
@@ -139,6 +159,7 @@ def _collect_dagger(
     mode_weights,
     regular_factors,
     dagger_steps,
+    collection_episode_steps,
     beta,
     rng,
     round_idx,
@@ -158,7 +179,15 @@ def _collect_dagger(
         rng, key = jax.random.split(rng)
         state = _set_mode(reset(key), omega)
         plan = jnp.zeros((planner.args.Hnode + 1, env.action_size))
-        for _ in range(dagger_steps):
+        for state_idx in range(dagger_steps):
+            if (
+                collection_episode_steps > 0
+                and state_idx > 0
+                and state_idx % collection_episode_steps == 0
+            ):
+                rng, key = jax.random.split(rng)
+                state = _set_mode(reset(key), omega)
+                plan = jnp.zeros_like(plan)
             state = step(_set_mode(state, omega), plan[0])
             state.reward.block_until_ready()
             if _physically_fallen(env, state):
@@ -249,6 +278,8 @@ def main() -> None:
     )
     if not 0.0 <= args.dagger_beta <= 1.0:
         raise ValueError("dagger beta must be in [0, 1]")
+    if args.collection_episode_steps < 0:
+        raise ValueError("collection episode steps must be non-negative")
 
     dial_config = load_dataclass_from_dict(DialConfig, config)
     if args.samples is not None:
@@ -302,6 +333,7 @@ def main() -> None:
             initial_factors,
             regular_factors,
             args.collect_steps,
+            args.collection_episode_steps,
             rng,
         )
     save_energy_dataset(run_dir / "energy_data.npz", base)
@@ -396,6 +428,7 @@ def main() -> None:
             mode_weights,
             regular_factors,
             args.dagger_steps,
+            args.collection_episode_steps,
             args.dagger_beta,
             rng,
             round_zero + 1,
@@ -434,6 +467,7 @@ def main() -> None:
             args.selection_steps,
             args.selection_seeds,
             minimum_mean_vx=args.minimum_mean_vx,
+            track_command=args.selection_track_command,
         )
         metrics["policy"] = str(path)
         selection.append(metrics)
@@ -478,6 +512,14 @@ def main() -> None:
         "selected": str(best[1]),
         "selected_metrics": best[2],
         "completed_gradient_steps": global_step,
+        "environment_randomization": {
+            key: value
+            for key, value in config.items()
+            if key == "randomize_tasks"
+            or key == "randomize_start_state"
+            or key.startswith("command_")
+            or key.startswith("start_")
+        },
     }
     (run_dir / "run_config.json").write_text(
         json.dumps(

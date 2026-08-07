@@ -33,6 +33,7 @@ from csm.policy import CompositionalPolicy
 from csm.training import fit_score_regression
 from dial_mpc.core.dial_config import DialConfig
 from dial_mpc.core.dial_core import MBDPI
+from dial_mpc.utils.function_utils import global_to_body_velocity
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 
 
@@ -101,7 +102,13 @@ def _concat_datasets(datasets):
 
 
 def _rollout_metrics(
-    env, policy, mode_weights, steps, seeds, minimum_mean_vx=None
+    env,
+    policy,
+    mode_weights,
+    steps,
+    seeds,
+    minimum_mean_vx=None,
+    track_command=False,
 ):
     reset = jax.jit(env.reset)
     step = jax.jit(env.step)
@@ -120,6 +127,8 @@ def _rollout_metrics(
             velocities = []
             actions = []
             tilts = []
+            tracking_errors = []
+            target_velocities = []
             survived = 0
             for step_idx in range(steps):
                 rng, key = jax.random.split(rng)
@@ -127,7 +136,34 @@ def _rollout_metrics(
                 state = step(_set_mode(state, omega), plan[0])
                 state.reward.block_until_ready()
                 actions.append(np.asarray(plan[0]))
-                velocities.append(float(state.pipeline_state.xd.vel[torso, 0]))
+                if track_command:
+                    body_velocity = global_to_body_velocity(
+                        state.pipeline_state.xd.vel[torso],
+                        state.pipeline_state.x.rot[torso],
+                    )
+                    body_angular_velocity = global_to_body_velocity(
+                        state.pipeline_state.xd.ang[torso] * jnp.pi / 180.0,
+                        state.pipeline_state.x.rot[torso],
+                    )
+                    velocity = float(body_velocity[0])
+                    tracking_error = float(
+                        jnp.sum(
+                            jnp.square(
+                                body_velocity[:2] - state.info["vel_tar"][:2]
+                            )
+                        )
+                        + jnp.square(
+                            body_angular_velocity[2]
+                            - state.info["ang_vel_tar"][2]
+                        )
+                    )
+                    target_velocities.append(float(state.info["vel_tar"][0]))
+                else:
+                    velocity = float(state.pipeline_state.xd.vel[torso, 0])
+                    tracking_error = (velocity - 0.8) ** 2
+                    target_velocities.append(0.8)
+                velocities.append(velocity)
+                tracking_errors.append(tracking_error)
                 euler = math.quat_to_euler(state.pipeline_state.x.rot[torso])
                 tilt = float(jnp.linalg.norm(euler[:2]))
                 tilts.append(tilt)
@@ -152,8 +188,9 @@ def _rollout_metrics(
                     "survived_steps": survived,
                     "fell": survived < steps,
                     "mean_vx": float(np.mean(velocities)),
+                    "mean_target_vx": float(np.mean(target_velocities)),
                     "tracking_rmse": float(
-                        np.sqrt(np.mean(np.square(np.asarray(velocities) - 0.8)))
+                        np.sqrt(np.mean(tracking_errors))
                     ),
                     "mean_tilt": float(np.mean(tilts)),
                     "action_jerk": jerk,
