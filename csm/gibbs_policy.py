@@ -10,12 +10,16 @@ import jax
 import jax.numpy as jnp
 
 from csm.energy_policy import normalize_preference_weights
-from csm.gibbs_data import anchor_decoder, compose_anchor_logits
+from csm.gibbs_data import (
+    anchor_decoder,
+    compose_anchor_logits,
+    standardized_gibbs_logits,
+)
 
 
 @dataclass
 class AnchorGibbsPolicy:
-    """Runs learned DIAL-TC-MPPI reweighting without physics rollouts."""
+    """Runs learned, reward-standardized DIAL-TC reweighting."""
 
     model: object
     normalizer: object
@@ -24,8 +28,12 @@ class AnchorGibbsPolicy:
     sigma_control: jax.Array
     diffuse_factors: jax.Array
     shift_matrix: jax.Array
-    candidate_count: int = 64
+    anchor_cost_scale: jax.Array | None = None
+    candidate_count: int = 128
     preference_weight_sum: float = 5.0
+    temperature: float = 0.05
+    scale_floor: float = 1e-6
+    format_version: int = 2
 
     def __post_init__(self):
         self.decoder = anchor_decoder(self.anchor_weights)
@@ -84,10 +92,27 @@ class AnchorGibbsPolicy:
             current, key = carry
             key, sample_key = jax.random.split(key)
             candidates = self._sample_candidates(current, factor, sample_key)
-            anchor_logits = self.model(
+            anchor_values = self.model(
                 current, candidates, observation, factor
             )
-            logits = compose_anchor_logits(anchor_logits, omega, self.decoder)
+            # Legacy checkpoints predicted already-standardized logits.  New
+            # checkpoints predict raw anchor costs and reproduce DIAL's
+            # weight-specific candidate standard deviation analytically.
+            if self.__dict__.get("format_version", 1) < 2:
+                logits = compose_anchor_logits(
+                    anchor_values, omega, self.decoder
+                )
+            else:
+                anchor_costs = anchor_values * self.anchor_cost_scale
+                weighted_costs = compose_anchor_logits(
+                    anchor_costs, omega, self.decoder
+                )
+                logits, _ = standardized_gibbs_logits(
+                    weighted_costs,
+                    self.temperature,
+                    self.scale_floor,
+                    candidate_axis=0,
+                )
             weights = jax.nn.softmax(logits)
             refined = jnp.einsum("m,mha->ha", weights, candidates)
             return (refined, key), None

@@ -105,10 +105,10 @@ Torch.
 
 For zero-shot preference composition, the recommended controller is the
 anchor-factorized Gibbs score model.  It uses DIAL-TC-MPPI's correlated
-candidate proposal, learns the clean candidate logits of only the configured
-full-rank anchor weights, composes unseen weights analytically before the
-softmax, and executes the resulting learned MPPI update without physics
-rollouts or action-gradient optimization:
+candidate proposal, learns raw candidate costs at only the configured
+full-rank anchor weights, composes unseen weights analytically, and reproduces
+DIAL's weight-specific reward standardization before the softmax.  Inference
+needs neither physics rollouts nor action-gradient optimization:
 
 ```bash
 dial-afgs --example unitree_go2_trot_tc --smoke
@@ -119,19 +119,28 @@ Run the deploy-scale pipeline with the same three anchor modes in
 
 ```bash
 dial-afgs --example unitree_go2_trot_tc \
-  --samples 2048 --model-candidates 64 --collect-steps 400 \
+  --samples 2048 --model-candidates 128 --banks-per-query 4 \
+  --collect-steps 400 \
   --train-iters 30000 --dagger-rounds 3 \
+  --dagger-betas 0.5,0.25,0.0 \
   --dagger-steps 200 --dagger-train-iters 15000 \
   --batch-size 128
 ```
 
-AFGS stores grouped candidate sets and anchor logits in `gibbs_data.npz`.
-No weights from the interior of the simplex are sampled during training.  An
-unseen preference `omega` is converted to anchor coordinates by solving
-`W.T @ alpha = omega`; candidate logits are combined as `L @ alpha` and only
-then passed through the Gibbs softmax.  A shared per-query logit scale is
-essential: normalizing rewards separately for each anchor would destroy this
-algebraic composition.
+AFGS stores deployment-distributed random candidate banks and raw anchor costs
+in `gibbs_data.npz`.  No weights from the interior of the simplex are sampled
+during training.  An unseen preference `omega` is converted to anchor
+coordinates by solving `W.T @ alpha = omega`; raw costs are combined as
+`C_anchor @ alpha`.  The composed costs are centered and standardized over the
+current candidate bank exactly as in DIAL-TC-MPPI.  Base and DAgger rounds are
+sampled equally, pre-fall queries receive elevated replay priority, and the
+default DAgger curriculum is `0.5, 0.25, 0.0`.
+
+Checkpoint publication is a hard deployment gate.  A checkpoint must survive
+300 steps at at least 0.5 m/s for every anchor and every unseen validation
+weight in `csm/go2_validation_weights.json`, across five seeds.  If no
+checkpoint passes, the run keeps its datasets, checkpoints, and diagnostics
+but intentionally does not publish a top-level `policy.pkl`.
 
 Run the end-to-end Go2 integration check:
 

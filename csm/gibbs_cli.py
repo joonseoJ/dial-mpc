@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import replace
 import json
 import shutil
@@ -43,6 +44,16 @@ from dial_mpc.core.dial_core import DIALTCMPPI
 from dial_mpc.utils.io_utils import load_dataclass_from_dict
 
 
+def _parse_betas(text: str) -> tuple[float, ...]:
+    try:
+        values = tuple(float(value) for value in text.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("betas must be comma-separated floats") from error
+    if not values or any(value < 0.0 or value > 1.0 for value in values):
+        raise argparse.ArgumentTypeError("every DAgger beta must be in [0, 1]")
+    return values
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -52,25 +63,32 @@ def _parser() -> argparse.ArgumentParser:
     source.add_argument("--config", type=Path)
     parser.add_argument("--output", type=Path, default=Path("csm_runs/anchor-gibbs"))
     parser.add_argument("--anchor-weights", type=Path, default=None)
+    parser.add_argument("--validation-weights", type=Path, default=None)
     parser.add_argument("--dataset", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--samples", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--collect-steps", type=int, default=400)
-    parser.add_argument("--model-candidates", type=int, default=64)
+    parser.add_argument("--model-candidates", type=int, default=128)
+    parser.add_argument("--banks-per-query", type=int, default=4)
     parser.add_argument("--train-iters", type=int, default=30_000)
     parser.add_argument("--dagger-rounds", type=int, default=3)
     parser.add_argument("--dagger-steps", type=int, default=200)
     parser.add_argument("--dagger-train-iters", type=int, default=15_000)
-    parser.add_argument("--dagger-beta", type=float, default=0.5)
+    parser.add_argument(
+        "--dagger-betas", type=_parse_betas, default=(0.5, 0.25, 0.0)
+    )
+    parser.add_argument("--prefall-window", type=int, default=10)
+    parser.add_argument("--prefall-priority", type=float, default=8.0)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--logit-weight", type=float, default=1.0)
+    parser.add_argument("--cost-weight", type=float, default=1.0)
     parser.add_argument("--kl-weight", type=float, default=1.0)
     parser.add_argument("--score-weight", type=float, default=0.2)
     parser.add_argument("--checkpoint-every", type=int, default=5_000)
     parser.add_argument("--selection-steps", type=int, default=300)
-    parser.add_argument("--selection-seeds", type=int, default=2)
+    parser.add_argument("--selection-seeds", type=int, default=5)
+    parser.add_argument("--minimum-mean-vx", type=float, default=0.5)
     parser.add_argument("--eval-steps", type=int, default=500)
     parser.add_argument("--smoke", action="store_true")
     return parser
@@ -86,6 +104,17 @@ def _append_history(history, action):
     return jnp.concatenate([history[1:], action[None]], axis=0)
 
 
+def _promote_prefall(chunks, recent_steps, priority):
+    """Raises replay priority for queries that produced an imminent fall."""
+
+    for step_indices in recent_steps:
+        for index in step_indices:
+            chunks[index] = replace(
+                chunks[index],
+                priorities=jnp.full_like(chunks[index].priorities, priority),
+            )
+
+
 def _collect_base(
     env,
     planner,
@@ -96,10 +125,13 @@ def _collect_base(
     initial_factors,
     regular_factors,
     collect_steps,
+    prefall_window,
+    prefall_priority,
     rng,
 ):
     chunks = []
     states, plans, histories = [], [], []
+    recent_steps = [deque(maxlen=prefall_window) for _ in anchor_weights]
     horizon = planner.args.Hnode + 1
     for omega in anchor_weights:
         rng, key = jax.random.split(rng)
@@ -121,18 +153,25 @@ def _collect_base(
             state.reward.block_until_ready()
             history = _append_history(history, executed)
             if _physically_fallen(env, state):
+                _promote_prefall(
+                    chunks, recent_steps[mode_idx], prefall_priority
+                )
+                recent_steps[mode_idx].clear()
                 rng, key = jax.random.split(rng)
                 state = _set_mode(reset(key), omega)
                 plan = jnp.zeros_like(plan)
                 history = _zero_history(planner)
             plan = planner.shift(plan)
             factors = initial_factors if state_idx == 0 else regular_factors
+            step_indices = []
             for factor in factors:
                 chunk, plan, rng = teacher.collect_query(
                     state, plan, float(factor), rng, omega, history
                 )
-                chunk.anchor_logits.block_until_ready()
+                chunk.anchor_costs.block_until_ready()
                 chunks.append(chunk)
+                step_indices.append(len(chunks) - 1)
+            recent_steps[mode_idx].append(step_indices)
             states[mode_idx], plans[mode_idx], histories[mode_idx] = (
                 state,
                 plan,
@@ -154,6 +193,8 @@ def _collect_dagger(
     regular_factors,
     dagger_steps,
     beta,
+    prefall_window,
+    prefall_priority,
     rng,
     round_idx,
 ):
@@ -173,12 +214,15 @@ def _collect_dagger(
         state = _set_mode(reset(key), omega)
         plan = jnp.zeros((planner.args.Hnode + 1, env.action_size))
         history = _zero_history(planner)
+        recent_steps = deque(maxlen=prefall_window)
         for _ in range(dagger_steps):
             executed = plan[0]
             state = step(_set_mode(state, omega), executed)
             state.reward.block_until_ready()
             history = _append_history(history, executed)
             if _physically_fallen(env, state):
+                _promote_prefall(chunks, recent_steps, prefall_priority)
+                recent_steps.clear()
                 rng, key = jax.random.split(rng)
                 state = _set_mode(reset(key), omega)
                 plan = jnp.zeros_like(plan)
@@ -187,12 +231,15 @@ def _collect_dagger(
             rng, policy_rng = jax.random.split(rng)
             learner = apply(shifted, state.obs, policy_rng, omega)
             expert = learner
+            step_indices = []
             for factor in regular_factors:
                 chunk, expert, rng = teacher.collect_query(
                     state, expert, float(factor), rng, omega, history
                 )
-                chunk.anchor_logits.block_until_ready()
+                chunk.anchor_costs.block_until_ready()
                 chunks.append(chunk)
+                step_indices.append(len(chunks) - 1)
+            recent_steps.append(step_indices)
             plan = jnp.clip((1.0 - beta) * learner + beta * expert, -1.0, 1.0)
             bar.update()
     bar.close()
@@ -206,19 +253,24 @@ def main() -> None:
         args.samples = 8
         args.collect_steps = 1
         args.model_candidates = 4
+        args.banks_per_query = 2
         args.train_iters = 2
         args.dagger_rounds = 1
+        args.dagger_betas = (0.0,)
         args.dagger_steps = 1
         args.dagger_train_iters = 2
         args.batch_size = 2
         args.checkpoint_every = 1
         args.selection_steps = 2
         args.selection_seeds = 1
+        args.minimum_mean_vx = None
         args.eval_steps = 2
 
-    if not 0.0 <= args.dagger_beta <= 1.0:
-        raise ValueError("dagger beta must be in [0, 1]")
-    if min(args.logit_weight, args.kl_weight, args.score_weight) < 0.0:
+    if len(args.dagger_betas) != args.dagger_rounds:
+        raise ValueError("dagger-betas must contain exactly dagger-rounds values")
+    if args.prefall_window < 1 or args.prefall_priority < 1.0:
+        raise ValueError("pre-fall window must be positive and priority must be >= 1")
+    if min(args.cost_weight, args.kl_weight, args.score_weight) < 0.0:
         raise ValueError("loss weights must be non-negative")
 
     env_name = config["env_name"]
@@ -244,6 +296,24 @@ def main() -> None:
     )
     if int(jnp.linalg.matrix_rank(anchor_weights)) != objective_spec.num_objectives:
         raise ValueError("anchor weights must span the objective space")
+    validation_path = args.validation_weights or Path(__file__).with_name(
+        "go2_validation_weights.json"
+    )
+    validation_weights = jnp.asarray(
+        json.loads(validation_path.read_text(encoding="utf-8")), dtype=jnp.float32
+    )
+    if (
+        validation_weights.ndim != 2
+        or validation_weights.shape[1] != objective_spec.num_objectives
+        or np.any(np.asarray(validation_weights) < 0.0)
+    ):
+        raise ValueError("validation weights must be non-negative objective rows")
+    validation_weights = normalize_preference_weights(
+        validation_weights, preference_weight_sum
+    )
+    selection_weights = jnp.concatenate(
+        [anchor_weights, validation_weights], axis=0
+    )
 
     dial_config = load_dataclass_from_dict(DialConfig, config)
     dial_config = replace(
@@ -265,6 +335,7 @@ def main() -> None:
         objective_spec.cost,
         anchor_weights,
         num_model_candidates=args.model_candidates,
+        banks_per_query=args.banks_per_query,
     )
     reset = jax.jit(env.reset)
     step = jax.jit(env.step)
@@ -305,12 +376,17 @@ def main() -> None:
             initial_factors,
             regular_factors,
             args.collect_steps,
+            args.prefall_window,
+            args.prefall_priority,
             rng,
         )
     save_gibbs_dataset(run_dir / "gibbs_data.npz", base)
 
     normalizer = StandardNormalizer(int(base.observations.shape[-1]))
     normalizer.fit(base.observations)
+    anchor_cost_scale = jnp.maximum(
+        jnp.std(base.anchor_costs, axis=(0, 1)), 1e-6
+    )
     model = AnchorLogitMLP(
         action_size=env.action_size,
         observation_size=int(base.observations.shape[-1]),
@@ -334,8 +410,11 @@ def main() -> None:
             sigma_control=planner.sigma_control,
             diffuse_factors=regular_factors,
             shift_matrix=shift_matrix,
+            anchor_cost_scale=anchor_cost_scale,
             candidate_count=args.model_candidates,
             preference_weight_sum=preference_weight_sum,
+            temperature=dial_config.temp_sample,
+            format_version=2,
         )
 
     checkpoints = []
@@ -373,7 +452,9 @@ def main() -> None:
             batch_size=args.batch_size,
             num_iters=iterations,
             rng=train_rng,
-            logit_weight=args.logit_weight,
+            anchor_cost_scale=anchor_cost_scale,
+            temperature=dial_config.temp_sample,
+            cost_weight=args.cost_weight,
             kl_weight=args.kl_weight,
             score_weight=args.score_weight,
             checkpoint_every=args.checkpoint_every,
@@ -400,7 +481,9 @@ def main() -> None:
             anchor_weights,
             regular_factors,
             args.dagger_steps,
-            args.dagger_beta,
+            args.dagger_betas[round_zero],
+            args.prefall_window,
+            args.prefall_priority,
             rng,
             round_zero + 1,
         )
@@ -421,9 +504,15 @@ def main() -> None:
         checkpoints.append(final_path)
 
     selection = []
-    best = None
+    best_eligible = None
+    best_diagnostic = None
+    unique_checkpoints = list(dict.fromkeys(checkpoints))
+    phase_finals = [
+        path for path in unique_checkpoints if path.parent.name.endswith("_final")
+    ]
+    selection_candidates = phase_finals or unique_checkpoints
     for path in tqdm(
-        list(dict.fromkeys(checkpoints)),
+        selection_candidates,
         desc="Anchor Gibbs checkpoint selection",
         unit="checkpoint",
     ):
@@ -431,19 +520,71 @@ def main() -> None:
         metrics = _rollout_metrics(
             env,
             candidate,
-            anchor_weights,
+            selection_weights,
             args.selection_steps,
             args.selection_seeds,
-            minimum_mean_vx=0.5,
+            minimum_mean_vx=args.minimum_mean_vx,
         )
         metrics["policy"] = str(path)
+        speed_passed = (
+            args.minimum_mean_vx is None
+            or metrics["qualified_survival_rate"] >= 1.0
+        )
+        metrics["hard_gate_passed"] = bool(
+            metrics["survival_rate"] >= 1.0 and speed_passed
+        )
         selection.append(metrics)
-        if best is None or metrics["selection_score"] > best[0]:
-            best = (metrics["selection_score"], path, metrics)
-    assert best is not None
+        candidate_record = (metrics["selection_score"], path, metrics)
+        if best_diagnostic is None or candidate_record[0] > best_diagnostic[0]:
+            best_diagnostic = candidate_record
+        if metrics["hard_gate_passed"] and (
+            best_eligible is None or candidate_record[0] > best_eligible[0]
+        ):
+            best_eligible = candidate_record
+    assert best_diagnostic is not None
     (run_dir / "checkpoint_selection.json").write_text(
         json.dumps(selection, indent=2), encoding="utf-8"
     )
+
+    config_out = {
+        **vars(args),
+        "framework": "anchor_factorized_raw_cost_gibbs_score_v2",
+        "expert": "DIAL-TC-MPPI",
+        "objective_names": list(objective_spec.names),
+        "anchor_weights": np.asarray(anchor_weights).tolist(),
+        "validation_weights": np.asarray(validation_weights).tolist(),
+        "anchor_condition_number": float(np.linalg.cond(np.asarray(anchor_weights))),
+        "anchor_cost_scale": np.asarray(anchor_cost_scale).tolist(),
+        "preference_weight_sum": preference_weight_sum,
+        "selection_hard_gate": {
+            "steps": args.selection_steps,
+            "seeds": args.selection_seeds,
+            "all_weights_must_survive": True,
+            "minimum_mean_vx": args.minimum_mean_vx,
+        },
+        "selection_passed": best_eligible is not None,
+        "selected": str(best_eligible[1]) if best_eligible else None,
+        "selected_metrics": best_eligible[2] if best_eligible else None,
+        "best_rejected_metrics": (
+            best_diagnostic[2] if best_eligible is None else None
+        ),
+        "completed_gradient_steps": global_step,
+    }
+    (run_dir / "run_config.json").write_text(
+        json.dumps(
+            {k: str(v) if isinstance(v, Path) else v for k, v in config_out.items()},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if best_eligible is None:
+        print(f"saved={run_dir}")
+        raise RuntimeError(
+            "no checkpoint survived the hard deployment gate on every anchor "
+            "and unseen validation weight; policy.pkl was intentionally not published"
+        )
+
+    best = best_eligible
     shutil.copy2(best[1], run_dir / "policy.pkl")
 
     policy = AnchorGibbsPolicy.load(run_dir / "policy.pkl")
@@ -471,25 +612,6 @@ def main() -> None:
         html.render(env.sys, rollout), encoding="utf-8"
     )
 
-    config_out = {
-        **vars(args),
-        "framework": "anchor_factorized_gibbs_score",
-        "expert": "DIAL-TC-MPPI",
-        "objective_names": list(objective_spec.names),
-        "anchor_weights": np.asarray(anchor_weights).tolist(),
-        "anchor_condition_number": float(np.linalg.cond(np.asarray(anchor_weights))),
-        "preference_weight_sum": preference_weight_sum,
-        "selected": str(best[1]),
-        "selected_metrics": best[2],
-        "completed_gradient_steps": global_step,
-    }
-    (run_dir / "run_config.json").write_text(
-        json.dumps(
-            {k: str(v) if isinstance(v, Path) else v for k, v in config_out.items()},
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
     print(f"selected={best[1]}")
     print(f"metrics={json.dumps(best[2])}")
     print(f"saved={run_dir}")

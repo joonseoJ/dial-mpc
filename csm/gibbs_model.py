@@ -12,10 +12,10 @@ from csm.architectures import MLP
 
 
 class AnchorLogitMLP(nnx.Module):
-    """Predicts one clean candidate logit for every anchor preference.
+    """Predicts one normalized raw cost for every anchor preference.
 
-    Weight composition is intentionally absent from this network.  It occurs
-    analytically on the output logits before Gibbs normalization.
+    Weight composition and reward standardization are intentionally absent
+    from this network.  Both occur analytically in the policy.
     """
 
     def __init__(
@@ -45,7 +45,7 @@ class AnchorLogitMLP(nnx.Module):
         observation: jax.Array,
         factor: jax.Array,
     ) -> jax.Array:
-        """Returns logits with shape ``(..., candidates, anchors)``."""
+        """Returns normalized costs with shape ``(..., candidates, anchors)``."""
 
         batch_shape = candidates.shape[:-3]
         count = candidates.shape[-3]

@@ -22,29 +22,45 @@ def fit_anchor_gibbs(
     batch_size: int,
     num_iters: int,
     rng: jax.Array,
-    logit_weight: float = 1.0,
+    anchor_cost_scale: jax.Array,
+    temperature: float,
+    cost_weight: float = 1.0,
     kl_weight: float = 1.0,
     score_weight: float = 0.2,
     checkpoint_every: int = 0,
     checkpoint_callback: Callable[[int, jax.Array], None] | None = None,
 ) -> jax.Array:
-    """Fits anchor logits, Gibbs distributions, and their induced updates."""
+    """Fits raw anchor costs, exact DIAL distributions, and their updates."""
 
     groups = [dataset] if isinstance(dataset, GibbsDataset) else list(dataset)
     if not groups:
         raise ValueError("at least one Gibbs dataset is required")
 
-    def loss_fn(model, observations, queries, candidates, target_logits, updates, factors):
-        observations = normalizer(observations, use_running_average=True)
-        predicted = model(queries, candidates, observations, factors)
-        predicted = predicted - jnp.mean(predicted, axis=1, keepdims=True)
-        target_logits = target_logits - jnp.mean(
-            target_logits, axis=1, keepdims=True
-        )
+    cost_scale = jnp.asarray(anchor_cost_scale)
 
-        logit_loss = jnp.mean(optax_huber(predicted - target_logits))
+    def loss_fn(model, observations, queries, candidates, target_costs, updates, factors):
+        observations = normalizer(observations, use_running_average=True)
+        predicted_normalized = model(queries, candidates, observations, factors)
+        predicted_normalized = predicted_normalized - jnp.mean(
+            predicted_normalized, axis=1, keepdims=True
+        )
+        target_costs = target_costs - jnp.mean(
+            target_costs, axis=1, keepdims=True
+        )
+        target_normalized = target_costs / cost_scale
+
+        cost_loss = jnp.mean(
+            optax_huber(predicted_normalized - target_normalized)
+        )
+        predicted_costs = predicted_normalized * cost_scale
+        target_std = jnp.maximum(jnp.std(target_costs, axis=1), 1e-6)
+        predicted_std = jnp.maximum(jnp.std(predicted_costs, axis=1), 1e-6)
+        target_logits = -target_costs / (target_std[:, None, :] * temperature)
+        predicted_logits = -predicted_costs / (
+            predicted_std[:, None, :] * temperature
+        )
         target_log_prob = jax.nn.log_softmax(target_logits, axis=1)
-        predicted_log_prob = jax.nn.log_softmax(predicted, axis=1)
+        predicted_log_prob = jax.nn.log_softmax(predicted_logits, axis=1)
         target_prob = jnp.exp(target_log_prob)
         kl_loss = jnp.mean(
             jnp.sum(
@@ -65,7 +81,7 @@ def fit_anchor_gibbs(
             optax_huber((predicted_updates - updates) / update_scale)
         )
         return (
-            logit_weight * logit_loss
+            cost_weight * cost_loss
             + kl_weight * kl_loss
             + score_weight * score_loss
         )
@@ -82,14 +98,21 @@ def fit_anchor_gibbs(
         rng, index_rng = jax.random.split(rng)
         current = groups[step % len(groups)]
         count = int(current.queries.shape[0])
-        indices = jax.random.randint(index_rng, (batch_size,), 0, count)
+        probabilities = current.priorities / jnp.sum(current.priorities)
+        indices = jax.random.choice(
+            index_rng,
+            count,
+            shape=(batch_size,),
+            replace=True,
+            p=probabilities,
+        )
         last_loss = train_step(
             model,
             optimizer,
             current.observations[indices],
             current.queries[indices],
             current.candidates[indices],
-            current.anchor_logits[indices],
+            current.anchor_costs[indices],
             current.anchor_updates[indices],
             current.factors[indices],
         )
