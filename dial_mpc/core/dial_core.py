@@ -115,14 +115,8 @@ class MBDPI:
         return nodes
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def sample_nodes(self, rng, Ybar_i, noise_scale, action_history=None):
-        """Samples the exact node proposal used by one DIAL reverse step.
-
-        Keeping proposal construction separate from rollout evaluation lets
-        structured imitation teachers reuse DIAL-TC-MPPI's correlated
-        proposal without maintaining a subtly different sampler.
-        """
-
+    def reverse_once(self, state, rng, Ybar_i, noise_scale, action_history=None):
+        # sample from q_i
         rng, Y0s_rng = jax.random.split(rng)
         eps_Y = jax.random.normal(
             Y0s_rng, (self.args.Nsample, self.args.Hnode + 1, self.nu)
@@ -155,19 +149,6 @@ class MBDPI:
         # Evaluate the center of the actual sampling distribution as well.
         Y0s = jnp.concatenate([Y0s, sampling_mean[None]], axis=0)
         Y0s = jnp.clip(Y0s, -1.0, 1.0)
-        if self.tc_sampler is not None:
-            tc_log_ratio = self.tc_sampler.log_importance_ratio(
-                Y0s, prior_mean, sampling_mean, noise_scale
-            )
-        else:
-            tc_log_ratio = jnp.zeros((Y0s.shape[0],), dtype=Y0s.dtype)
-        return rng, Y0s, prior_mean, sampling_mean, tc_log_ratio
-
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def reverse_once(self, state, rng, Ybar_i, noise_scale, action_history=None):
-        rng, Y0s, prior_mean, sampling_mean, tc_log_ratio = self.sample_nodes(
-            rng, Ybar_i, noise_scale, action_history
-        )
         # convert Y0s to us
         us = self.node2u_vvmap(Y0s)
 
@@ -181,7 +162,12 @@ class MBDPI:
         reward_scale = jnp.maximum(rews.std(axis=-1), 1e-6)
         logp0 = (rews - rew_Ybar_i) / reward_scale / self.args.temp_sample
         if self.tc_sampler is not None:
+            tc_log_ratio = self.tc_sampler.log_importance_ratio(
+                Y0s, prior_mean, sampling_mean, noise_scale
+            )
             logp0 = logp0 + self.args.tc_importance_scale * tc_log_ratio
+        else:
+            tc_log_ratio = jnp.zeros_like(logp0)
 
         weights = jax.nn.softmax(logp0)
         Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)

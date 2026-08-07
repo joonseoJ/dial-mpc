@@ -5,7 +5,7 @@
 `csm` is a JAX/Brax-native extension of this repository.  Do not add imports
 from the prototype's former `hydrax`, `gpc`, Warp, or Torch projects.
 
-## Mathematical targets
+## Mathematical target
 
 For normalized DIAL action sequences `U` in `[-1, 1]`, data collection uses
 plain isotropic MPPI:
@@ -28,30 +28,6 @@ Compose raw scalar energies, never finite-sample MPPI bounded updates.  The
 Gibbs normalization and action clipping make the latter nonlinear in omega.
 Exact `MBDPI.reverse_once` updates are permitted only as derivative-direction
 supervision for the composed energy.
-
-The preferred zero-shot controller is the anchor-factorized Gibbs score model.
-It learns raw candidate costs at a full-rank set of anchor weights, composes
-an arbitrary preference, and then reproduces DIAL's weight-dependent reward
-standardization before applying the nonlinear Gibbs softmax:
-
-```
-W.T @ alpha = omega
-cost_omega(V) = sum_a alpha[a] * cost_anchor[a](V)
-scale_omega = std_V(cost_omega(V))
-logit_omega(V) = -(cost_omega(V) - mean_V(cost_omega(V))) / (temperature * scale_omega)
-weight(V) = softmax_V(logit_omega(V))
-U <- sum_V weight(V) * V
-```
-
-Never linearly compose normalized Gibbs weights or already-noised scores.
-AFGS data must use `DIALTCMPPI` proposals, random candidate banks distributed
-like deployment, and raw costs before reward standardization.  Do not use a
-shared anchor scale: it is compositional but does not reproduce true DIAL.
-Compute the unseen weight's scale from its composed costs in the current bank.
-The Go2 TC example must expose sine/cosine gait phase because the raw gait
-cost is not identifiable from the phase-free observation.  DAgger must use
-multiple pure-student (`beta=0`) rounds after its mixed-policy curriculum and
-prioritize queries immediately preceding physical falls.
 
 ## DIAL integration
 
@@ -87,7 +63,6 @@ Run the complete minimal integration test on GPU:
 ```bash
 source .venv/bin/activate
 dial-csm --example unitree_go2_trot --smoke
-dial-afgs --example unitree_go2_trot_tc --smoke
 ```
 
 It must create a loadable `policy.pkl`, `scores.npz`, and

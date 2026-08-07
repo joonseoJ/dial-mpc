@@ -41,7 +41,6 @@ setup(
             "dial-mpc-plan=dial_mpc.deploy.dial_plan:main",
             "dial-mpc-weights=dial_mpc.deploy.dial_weights:main",
             "dial-csm=dial_mpc.csm_entrypoint:train",
-            "dial-afgs=dial_mpc.csm_entrypoint:train_anchor_gibbs",
             "dial-csm-benchmark=dial_mpc.csm_entrypoint:benchmark",
             "dial-csm-eval=dial_mpc.csm_entrypoint:evaluate",
         ],

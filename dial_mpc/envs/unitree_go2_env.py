@@ -31,7 +31,6 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     default_vyaw: float = 0.0
     ramp_up_time: float = 2.0
     gait: str = "trot"
-    include_gait_phase_observation: bool = False
     reward_weights: jax.Array = field(
         default_factory=lambda: jnp.array([1.0, 1.0, 1.0])
     )
@@ -44,9 +43,6 @@ class UnitreeGo2Env(BaseEnv):
         self._foot_radius = 0.0175
 
         self._gait = config.gait
-        self._include_gait_phase_observation = (
-            config.include_gait_phase_observation
-        )
         self._gait_phase = {
             "stand": jnp.zeros(4),
             "walk": jnp.array([0.0, 0.5, 0.75, 0.25]),
@@ -250,8 +246,6 @@ class UnitreeGo2Env(BaseEnv):
 
         # state management
         state.info["step"] += 1
-        if self._include_gait_phase_observation:
-            obs = obs.at[-2:].set(self._gait_phase_observation(state.info["step"]))
         state.info["rng"] = rng
         state.info["z_feet"] = z_feet
         state.info["z_feet_tar"] = z_feet_tar
@@ -275,24 +269,18 @@ class UnitreeGo2Env(BaseEnv):
         ab = global_to_body_velocity(
             xd.ang[self._torso_idx - 1] * jnp.pi / 180.0, x.rot[self._torso_idx - 1]
         )
-        features = [
-            state_info["vel_tar"],
-            state_info["ang_vel_tar"],
-            pipeline_state.ctrl,
-            pipeline_state.qpos,
-            vb,
-            ab,
-            pipeline_state.qvel[6:],
-        ]
-        if self._include_gait_phase_observation:
-            features.append(self._gait_phase_observation(state_info["step"]))
-        obs = jnp.concatenate(features)
+        obs = jnp.concatenate(
+            [
+                state_info["vel_tar"],
+                state_info["ang_vel_tar"],
+                pipeline_state.ctrl,
+                pipeline_state.qpos,
+                vb,
+                ab,
+                pipeline_state.qvel[6:],
+            ]
+        )
         return obs
-
-    def _gait_phase_observation(self, step):
-        cadence = self._gait_params[self._gait][1]
-        angle = step * self.dt * 2.0 * jnp.pi * cadence
-        return jnp.stack([jnp.sin(angle), jnp.cos(angle)])
 
     def render(
         self,

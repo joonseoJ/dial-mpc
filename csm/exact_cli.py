@@ -107,12 +107,12 @@ def _rollout_metrics(
     step = jax.jit(env.step)
     torso = int(env._torso_idx) - 1
     records = []
-    apply = jax.jit(
-        lambda plan, obs, key, weight: policy.apply(
-            plan, obs, key, warm_start_level=1.0, omega=weight
-        )
-    )
     for mode_idx, omega in enumerate(mode_weights):
+        apply = jax.jit(
+            lambda plan, obs, key: policy.apply(
+                plan, obs, key, warm_start_level=1.0, omega=omega
+            )
+        )
         for seed in range(seeds):
             rng = jax.random.PRNGKey(10_000 + 97 * mode_idx + seed)
             state = _set_mode(reset(rng), omega)
@@ -123,7 +123,7 @@ def _rollout_metrics(
             survived = 0
             for step_idx in range(steps):
                 rng, key = jax.random.split(rng)
-                plan = apply(plan, state.obs, key, omega)
+                plan = apply(plan, state.obs, key)
                 state = step(_set_mode(state, omega), plan[0])
                 state.reward.block_until_ready()
                 actions.append(np.asarray(plan[0]))
