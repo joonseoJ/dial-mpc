@@ -123,7 +123,8 @@ dial-csm --example unitree_go2_trot \
   --energy-candidates 64 --teacher-repeats 8 \
   --train-iters 30000 --dagger-rounds 3 \
   --dagger-steps 200 --dagger-train-iters 15000 \
-  --batch-size 256 --calibration-weight 0.1 --sobolev-weight 0.1 \
+  --batch-size 256 --guidance-weight 0.2 \
+  --calibration-weight 0.1 --sobolev-weight 0.1 \
   --energy-steps 8 --energy-step-size 1.0 --trust-radius 0.05 \
   --minimum-mean-vx 0.5
 ```

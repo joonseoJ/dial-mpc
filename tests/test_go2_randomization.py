@@ -6,6 +6,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from dial_mpc.envs.unitree_go2_env import UnitreeGo2Env, UnitreeGo2EnvConfig
+from csm.energy_cli import (
+    _dagger_beta_schedule,
+    _parse_episode_lengths,
+    _sample_episode_limit,
+)
 
 
 def _bare_env(config):
@@ -24,6 +29,20 @@ def _bare_env(config):
 
 
 class Go2RandomizationTest(unittest.TestCase):
+    def test_short_long_episode_pool_and_student_only_schedule(self):
+        lengths = _parse_episode_lengths("80,80,400")
+        self.assertEqual(lengths, (80, 80, 400))
+        rng = jax.random.PRNGKey(19)
+        sampled = []
+        for _ in range(64):
+            rng, limit = _sample_episode_limit(rng, lengths)
+            sampled.append(limit)
+        self.assertEqual(set(sampled), {80, 400})
+        self.assertEqual(
+            _dagger_beta_schedule(5, 0.5, 2),
+            [0.5, 0.5, 0.5, 0.0, 0.0],
+        )
+
     def test_command_samples_respect_configured_bounds(self):
         config = UnitreeGo2EnvConfig(
             command_vx_min=0.4,
@@ -67,7 +86,9 @@ class Go2RandomizationTest(unittest.TestCase):
         self.assertTrue(bool(jnp.all(qpos_a[7:] < 1.0)))
 
     def test_disabled_reset_randomization_preserves_nominal_state(self):
-        env = _bare_env(UnitreeGo2EnvConfig(randomize_start_state=False))
+        config = UnitreeGo2EnvConfig(randomize_start_state=False)
+        self.assertFalse(config.include_foot_height_observation)
+        env = _bare_env(config)
         qpos, qvel = env._sample_initial_state(jax.random.PRNGKey(3))
         np.testing.assert_allclose(qpos, env._init_q)
         np.testing.assert_allclose(qvel, 0.0)

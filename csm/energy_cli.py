@@ -43,6 +43,36 @@ from dial_mpc.core.dial_core import MBDPI
 from dial_mpc.utils.io_utils import load_dataclass_from_dict
 
 
+def _parse_episode_lengths(text: str) -> tuple[int, ...]:
+    try:
+        lengths = tuple(int(value) for value in text.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "episode lengths must be comma-separated integers"
+        ) from exc
+    if not lengths or any(length <= 0 for length in lengths):
+        raise argparse.ArgumentTypeError("episode lengths must all be positive")
+    return lengths
+
+
+def _sample_episode_limit(rng, episode_lengths):
+    if not episode_lengths:
+        return rng, None
+    rng, key = jax.random.split(rng)
+    index = int(jax.random.randint(key, (), 0, len(episode_lengths)))
+    return rng, int(episode_lengths[index])
+
+
+def _dagger_beta_schedule(rounds, mixed_beta, student_only_rounds):
+    if not 0 <= student_only_rounds <= rounds:
+        raise ValueError(
+            "student-only DAgger rounds must be between zero and dagger rounds"
+        )
+    return [mixed_beta] * (rounds - student_only_rounds) + [
+        0.0
+    ] * student_only_rounds
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -61,7 +91,16 @@ def _parser() -> argparse.ArgumentParser:
         "--collection-episode-steps",
         type=int,
         default=0,
-        help="periodically reset collection episodes; 0 resets only after falls",
+        help="legacy fixed reset interval; use --collection-episode-lengths",
+    )
+    parser.add_argument(
+        "--collection-episode-lengths",
+        type=_parse_episode_lengths,
+        default=None,
+        help=(
+            "randomly sample a reset interval from this comma-separated pool; "
+            "duplicates control the short/long episode mixture"
+        ),
     )
     parser.add_argument("--energy-candidates", type=int, default=64)
     parser.add_argument("--teacher-repeats", type=int, default=8)
@@ -70,11 +109,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dagger-steps", type=int, default=200)
     parser.add_argument("--dagger-train-iters", type=int, default=15_000)
     parser.add_argument("--dagger-beta", type=float, default=0.5)
+    parser.add_argument(
+        "--student-only-dagger-rounds",
+        type=int,
+        default=1,
+        help="number of final DAgger rounds collected with beta=0",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--guidance-weight", type=float, default=0.2)
+    parser.add_argument("--guidance-weight", type=float, default=0.3)
     parser.add_argument("--calibration-weight", type=float, default=0.1)
-    parser.add_argument("--sobolev-weight", type=float, default=0.1)
+    parser.add_argument("--sobolev-weight", type=float, default=0.2)
     parser.add_argument("--energy-steps", type=int, default=8)
     parser.add_argument("--energy-step-size", type=float, default=1.0)
     parser.add_argument("--trust-radius", type=float, default=0.05)
@@ -102,17 +147,22 @@ def _collect_base(
     initial_factors,
     regular_factors,
     collect_steps,
-    collection_episode_steps,
+    episode_lengths,
     rng,
 ):
     chunks = []
     states = []
     plans = []
+    episode_ages = []
+    episode_limits = []
     horizon = planner.args.Hnode + 1
     for omega in mode_weights:
         rng, key = jax.random.split(rng)
         states.append(_set_mode(reset(key), omega))
         plans.append(jnp.zeros((horizon, env.action_size)))
+        episode_ages.append(0)
+        rng, episode_limit = _sample_episode_limit(rng, episode_lengths)
+        episode_limits.append(episode_limit)
     bar = tqdm(
         total=collect_steps * len(mode_weights),
         desc="Compositional energy collection",
@@ -121,20 +171,23 @@ def _collect_base(
     for state_idx in range(collect_steps):
         for mode_idx, omega in enumerate(mode_weights):
             state, plan = states[mode_idx], plans[mode_idx]
-            if (
-                collection_episode_steps > 0
-                and state_idx > 0
-                and state_idx % collection_episode_steps == 0
-            ):
+            episode_limit = episode_limits[mode_idx]
+            if episode_limit is not None and episode_ages[mode_idx] >= episode_limit:
                 rng, key = jax.random.split(rng)
                 state = _set_mode(reset(key), omega)
                 plan = jnp.zeros_like(plan)
+                episode_ages[mode_idx] = 0
+                rng, episode_limit = _sample_episode_limit(rng, episode_lengths)
+                episode_limits[mode_idx] = episode_limit
             state = step(_set_mode(state, omega), plan[0])
             state.reward.block_until_ready()
             if _physically_fallen(env, state):
                 rng, key = jax.random.split(rng)
                 state = _set_mode(reset(key), omega)
                 plan = jnp.zeros_like(plan)
+                episode_ages[mode_idx] = 0
+                rng, episode_limit = _sample_episode_limit(rng, episode_lengths)
+                episode_limits[mode_idx] = episode_limit
             plan = planner.shift(plan)
             factors = initial_factors if state_idx == 0 else regular_factors
             for factor in factors:
@@ -144,6 +197,7 @@ def _collect_base(
                 chunk.costs.block_until_ready()
                 chunks.append(chunk)
             states[mode_idx], plans[mode_idx] = state, plan
+            episode_ages[mode_idx] += 1
             bar.update()
     bar.close()
     return concatenate_energy_datasets(chunks), rng
@@ -159,7 +213,7 @@ def _collect_dagger(
     mode_weights,
     regular_factors,
     dagger_steps,
-    collection_episode_steps,
+    episode_lengths,
     beta,
     rng,
     round_idx,
@@ -179,21 +233,23 @@ def _collect_dagger(
         rng, key = jax.random.split(rng)
         state = _set_mode(reset(key), omega)
         plan = jnp.zeros((planner.args.Hnode + 1, env.action_size))
+        episode_age = 0
+        rng, episode_limit = _sample_episode_limit(rng, episode_lengths)
         for state_idx in range(dagger_steps):
-            if (
-                collection_episode_steps > 0
-                and state_idx > 0
-                and state_idx % collection_episode_steps == 0
-            ):
+            if episode_limit is not None and episode_age >= episode_limit:
                 rng, key = jax.random.split(rng)
                 state = _set_mode(reset(key), omega)
                 plan = jnp.zeros_like(plan)
+                episode_age = 0
+                rng, episode_limit = _sample_episode_limit(rng, episode_lengths)
             state = step(_set_mode(state, omega), plan[0])
             state.reward.block_until_ready()
             if _physically_fallen(env, state):
                 rng, key = jax.random.split(rng)
                 state = _set_mode(reset(key), omega)
                 plan = jnp.zeros_like(plan)
+                episode_age = 0
+                rng, episode_limit = _sample_episode_limit(rng, episode_lengths)
             shifted = planner.shift(plan)
             rng, policy_rng = jax.random.split(rng)
             learner = apply(shifted, state.obs, policy_rng, omega)
@@ -205,6 +261,7 @@ def _collect_dagger(
                 chunk.costs.block_until_ready()
                 chunks.append(chunk)
             plan = jnp.clip((1.0 - beta) * learner + beta * teacher_plan, -1.0, 1.0)
+            episode_age += 1
             bar.update()
     bar.close()
     return concatenate_energy_datasets(chunks), rng
@@ -255,6 +312,14 @@ def main() -> None:
         args.selection_seeds = 1
         args.eval_steps = 2
 
+    episode_lengths = args.collection_episode_lengths
+    if episode_lengths is None:
+        episode_lengths = (
+            (args.collection_episode_steps,)
+            if args.collection_episode_steps > 0
+            else ()
+        )
+
     env_name = config["env_name"]
     env_config = load_dataclass_from_dict(
         dial_envs.get_config(env_name), config, convert_list_to_array=True
@@ -280,6 +345,11 @@ def main() -> None:
         raise ValueError("dagger beta must be in [0, 1]")
     if args.collection_episode_steps < 0:
         raise ValueError("collection episode steps must be non-negative")
+    dagger_beta_schedule = _dagger_beta_schedule(
+        args.dagger_rounds,
+        args.dagger_beta,
+        args.student_only_dagger_rounds,
+    )
 
     dial_config = load_dataclass_from_dict(DialConfig, config)
     if args.samples is not None:
@@ -333,7 +403,7 @@ def main() -> None:
             initial_factors,
             regular_factors,
             args.collect_steps,
-            args.collection_episode_steps,
+            episode_lengths,
             rng,
         )
     save_energy_dataset(run_dir / "energy_data.npz", base)
@@ -428,8 +498,8 @@ def main() -> None:
             mode_weights,
             regular_factors,
             args.dagger_steps,
-            args.collection_episode_steps,
-            args.dagger_beta,
+            episode_lengths,
+            dagger_beta_schedule[round_zero],
             rng,
             round_zero + 1,
         )
@@ -512,11 +582,14 @@ def main() -> None:
         "selected": str(best[1]),
         "selected_metrics": best[2],
         "completed_gradient_steps": global_step,
+        "resolved_collection_episode_lengths": list(episode_lengths),
+        "dagger_beta_schedule": dagger_beta_schedule,
         "environment_randomization": {
             key: value
             for key, value in config.items()
             if key == "randomize_tasks"
             or key == "randomize_start_state"
+            or key == "include_foot_height_observation"
             or key.startswith("command_")
             or key.startswith("start_")
         },

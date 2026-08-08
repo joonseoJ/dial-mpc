@@ -29,6 +29,7 @@ default_vyaw: 0.0
 ramp_up_time: 1.0
 gait: trot
 reward_weights: [1.0, 1.0, 1.0]
+include_foot_height_observation: true
 
 # Target command distribution.  These ranges keep forward trot dominant while
 # covering lateral motion and moderate turning.  One command lasts 5 seconds.

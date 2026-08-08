@@ -31,6 +31,7 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     default_vyaw: float = 0.0
     ramp_up_time: float = 2.0
     gait: str = "trot"
+    include_foot_height_observation: bool = False
     command_vx_min: float = -1.5
     command_vx_max: float = 1.5
     command_vy_min: float = -0.5
@@ -353,17 +354,30 @@ class UnitreeGo2Env(BaseEnv):
         ab = global_to_body_velocity(
             xd.ang[self._torso_idx - 1] * jnp.pi / 180.0, x.rot[self._torso_idx - 1]
         )
-        obs = jnp.concatenate(
-            [
-                state_info["vel_tar"],
-                state_info["ang_vel_tar"],
-                pipeline_state.ctrl,
-                pipeline_state.qpos,
-                vb,
-                ab,
-                pipeline_state.qvel[6:],
-            ]
-        )
+        features = [
+            state_info["vel_tar"],
+            state_info["ang_vel_tar"],
+            pipeline_state.ctrl,
+            pipeline_state.qpos,
+            vb,
+            ab,
+            pipeline_state.qvel[6:],
+        ]
+        if self._config.include_foot_height_observation:
+            duty_ratio, cadence, amplitude = self._gait_params[self._gait]
+            phases = self._gait_phase[self._gait]
+            target_foot_height = get_foot_step(
+                duty_ratio,
+                cadence,
+                amplitude,
+                phases,
+                state_info["step"] * self.dt,
+            )
+            actual_foot_height = pipeline_state.site_xpos[
+                self._feet_site_id
+            ][:, 2]
+            features.extend([target_foot_height, actual_foot_height])
+        obs = jnp.concatenate(features)
         return obs
 
     def render(
