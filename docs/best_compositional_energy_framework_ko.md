@@ -22,7 +22,7 @@ checkpoints/step_065000_dagger_3/policy.pkl
 trajectory를 실제 dynamics에 넣어 미래 horizon 동안 실행했을 때 누적되는
 objective별 cost를 근사한다.
 
-현재 simulator state를 $x_0$, 여기서 얻은 observation을 $o=g(x_0)$라고 하자.
+현재 simulator state를 $x_0$, 여기서 얻은 observation을 $o=g(x_0)$라고 하자 (4.1 참고).
 action-node trajectory는 $U=(u_0,\ldots,u_H)$이다. Go2 설정에서는 5개 node를
 사용하며, DIAL의 spline 변환 $\mathcal S$가 이들을 16개의 simulation action으로
 변환한다.

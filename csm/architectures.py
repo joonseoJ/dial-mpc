@@ -459,16 +459,12 @@ class CompositionalEnergyMLP(nnx.Module):
         encoder_hidden: Sequence[int],
         head_hidden: Sequence[int],
         rngs: nnx.Rngs,
+        magnitude_hidden: Sequence[int] = (128, 128),
     ) -> None:
         self.action_size = int(action_size)
         self.observation_size = int(observation_size)
         self.horizon = int(horizon)
         self.num_objectives = int(num_objectives)
-        # Converts a physical cost gradient into a controller displacement.
-        # Sobolev supervision determines the energy gradients themselves;
-        # DIAL magnitude calibration learns only this separate positive scale.
-        self.log_update_scale = nnx.Param(jnp.log(jnp.asarray(0.1)))
-
         input_size = self.horizon * self.action_size + self.observation_size
         latent_size = int(encoder_hidden[-1])
         self.encoder = MLP(
@@ -480,6 +476,13 @@ class CompositionalEnergyMLP(nnx.Module):
                 f"energy_head{i}",
                 MLP([latent_size] + list(head_hidden) + [1], rngs=rngs),
             )
+        # Deployment step length is deliberately separate from the energy
+        # encoder.  Its bounded scalar output cannot change the compositional
+        # energy gradient direction or corrupt the shared energy features.
+        magnitude_input = input_size + self.num_objectives
+        self.magnitude_head = MLP(
+            [magnitude_input] + list(magnitude_hidden) + [1], rngs=rngs
+        )
 
     def forward_all(self, u: jax.Array, y: jax.Array) -> jax.Array:
         """Return normalized scalar energies with shape ``(*batch, k)``."""
@@ -496,3 +499,18 @@ class CompositionalEnergyMLP(nnx.Module):
 
     def __call__(self, u: jax.Array, y: jax.Array) -> jax.Array:
         return self.forward_all(u, y)
+
+    def predict_update_magnitude(
+        self,
+        u: jax.Array,
+        y: jax.Array,
+        omega: jax.Array,
+        maximum: float,
+    ) -> jax.Array:
+        """Predict the complete call's RMS budget in ``[0, maximum]``."""
+        batches = u.shape[:-2]
+        u_flat = u.reshape(batches + (self.horizon * self.action_size,))
+        omega = omega / (jnp.sum(omega, axis=-1, keepdims=True) + 1e-8)
+        features = jnp.concatenate([u_flat, y, omega], axis=-1)
+        logit = self.magnitude_head(features)[..., 0]
+        return jnp.asarray(maximum, dtype=logit.dtype) * jax.nn.sigmoid(logit)

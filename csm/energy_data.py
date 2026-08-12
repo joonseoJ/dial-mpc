@@ -25,6 +25,23 @@ class EnergyDataset:
     guidance_updates: jax.Array
     guidance_objective_gradients: jax.Array
     guidance_gradient_valid: jax.Array
+    guidance_recovery_difficulty: jax.Array
+
+
+@dataclass
+class ClosedLoopDataset:
+    """Short student-plan rollouts collected on DAgger state sequences.
+
+    Environment observations are treated as fixed, stop-gradient states during
+    training.  Plans remain autoregressive: the optimized plan is shifted and
+    becomes the next step's warm start, exactly as it does during deployment.
+    """
+
+    initial_plans: jax.Array
+    observations: jax.Array
+    omegas: jax.Array
+    teacher_plans: jax.Array
+    valid: jax.Array
 
 
 def concatenate_energy_datasets(datasets: Sequence[EnergyDataset]) -> EnergyDataset:
@@ -37,6 +54,60 @@ def concatenate_energy_datasets(datasets: Sequence[EnergyDataset]) -> EnergyData
             for name in fields
         }
     )
+
+
+def concatenate_closed_loop_datasets(
+    datasets: Sequence[ClosedLoopDataset],
+) -> ClosedLoopDataset:
+    if not datasets:
+        raise ValueError("at least one closed-loop dataset is required")
+    return ClosedLoopDataset(
+        **{
+            name: jnp.concatenate([getattr(dataset, name) for dataset in datasets])
+            for name in ClosedLoopDataset.__dataclass_fields__
+        }
+    )
+
+
+def make_closed_loop_windows(
+    warm_start_plans: jax.Array,
+    observations: jax.Array,
+    omegas: jax.Array,
+    teacher_plans: jax.Array,
+    sequence_length: int,
+) -> ClosedLoopDataset:
+    """Create overlapping, boundary-safe temporal windows for one rollout."""
+    if sequence_length < 1:
+        raise ValueError("closed-loop sequence length must be positive")
+    count = int(observations.shape[0])
+    if count < 1:
+        raise ValueError("a closed-loop rollout must contain at least one step")
+    windows = []
+    for start in range(count):
+        stop = min(start + sequence_length, count)
+        length = stop - start
+        pad = sequence_length - length
+
+        def padded(values):
+            chunk = values[start:stop]
+            if not pad:
+                return chunk
+            padding = jnp.repeat(chunk[-1:], pad, axis=0)
+            return jnp.concatenate([chunk, padding], axis=0)
+
+        windows.append(
+            (
+                warm_start_plans[start],
+                padded(observations),
+                padded(omegas),
+                padded(teacher_plans),
+                jnp.concatenate(
+                    [jnp.ones(length), jnp.zeros(pad)], axis=0
+                ),
+            )
+        )
+    fields = zip(*windows)
+    return ClosedLoopDataset(*(jnp.stack(field) for field in fields))
 
 
 def save_energy_dataset(path: Path | str, dataset: EnergyDataset) -> None:
@@ -71,7 +142,35 @@ def load_energy_dataset(path: Path | str) -> EnergyDataset:
             arrays["guidance_gradient_valid"] = jnp.zeros(
                 (plans.shape[0],), dtype=jnp.float32
             )
+        if "guidance_recovery_difficulty" not in arrays:
+            arrays["guidance_recovery_difficulty"] = jnp.zeros(
+                (arrays["guidance_plans"].shape[0],), dtype=jnp.float32
+            )
         return EnergyDataset(**arrays)
+
+
+def save_closed_loop_dataset(
+    path: Path | str, dataset: ClosedLoopDataset
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        **{
+            name: np.asarray(getattr(dataset, name))
+            for name in ClosedLoopDataset.__dataclass_fields__
+        },
+    )
+
+
+def load_closed_loop_dataset(path: Path | str) -> ClosedLoopDataset:
+    with np.load(path) as archive:
+        return ClosedLoopDataset(
+            **{
+                name: jnp.asarray(archive[name])
+                for name in ClosedLoopDataset.__dataclass_fields__
+            }
+        )
 
 
 class ExactEnergyCollector:
@@ -127,6 +226,20 @@ class ExactEnergyCollector:
 
     def collect_query(self, state, query, factor, rng, omega) -> tuple[EnergyDataset, jax.Array, jax.Array]:
         """Collect value labels and an averaged exact-DIAL direction anchor."""
+        return self.collect_query_with_difficulty(
+            state, query, factor, rng, omega, recovery_difficulty=0.0
+        )
+
+    def collect_query_with_difficulty(
+        self,
+        state,
+        query,
+        factor,
+        rng,
+        omega,
+        recovery_difficulty,
+    ) -> tuple[EnergyDataset, jax.Array, jax.Array]:
+        """Collect one query and retain its state-level recovery priority."""
         state = self._set_weights(state, omega)
         noise_scale = self.planner.sigma_control * jnp.asarray(factor)
         refined = []
@@ -171,5 +284,8 @@ class ExactEnergyCollector:
             guidance_updates=(mean_refined - query)[None],
             guidance_objective_gradients=objective_gradients[None],
             guidance_gradient_valid=jnp.ones((1,), dtype=jnp.float32),
+            guidance_recovery_difficulty=jnp.asarray(
+                [recovery_difficulty], dtype=jnp.float32
+            ),
         )
         return dataset, mean_refined, rng

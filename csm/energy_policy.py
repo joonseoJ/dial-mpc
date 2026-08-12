@@ -33,6 +33,7 @@ class CompositionalEnergyPolicy:
     lock_first_action: bool = True
     trust_radius: float | None = 0.05
     preference_weight_sum: float | None = None
+    magnitude_is_total_budget: bool = True
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -52,6 +53,11 @@ class CompositionalEnergyPolicy:
             policy.trust_radius = None
         if "preference_weight_sum" not in getattr(policy, "__dict__", {}):
             policy.preference_weight_sum = None
+        # Policies trained before the total-budget formulation interpreted the
+        # magnitude head output as an inner optimizer-step length.  Preserve
+        # that behavior when evaluating historical checkpoints.
+        if "magnitude_is_total_budget" not in getattr(policy, "__dict__", {}):
+            policy.magnitude_is_total_budget = False
         return policy
 
     def energies(self, plan, observation):
@@ -82,20 +88,48 @@ class CompositionalEnergyPolicy:
             return jnp.dot(omega, raw)
 
         trust_anchor = plan
+        trust_radius = getattr(self, "trust_radius", None)
+        use_total_budget = (
+            trust_radius is not None
+            and getattr(self.model, "magnitude_head", None) is not None
+            and getattr(self, "magnitude_is_total_budget", False)
+        )
+        total_budget = (
+            self.model.predict_update_magnitude(
+                trust_anchor, observation, omega, trust_radius
+            )
+            if use_total_budget
+            else None
+        )
 
-        def optimize(carry, _):
+        def optimize(carry, step_index):
             current, velocity = carry
             gradient = jax.grad(energy)(current)
             if self.lock_first_action:
                 gradient = gradient.at[0].set(0.0)
-            log_update_scale = getattr(self.model, "log_update_scale", None)
-            update_scale = (
-                jnp.exp(log_update_scale.value)
-                if log_update_scale is not None
-                else jnp.asarray(1.0)
-            )
-            direction = -update_scale * gradient
-            trust_radius = getattr(self, "trust_radius", None)
+            gradient_rms = jnp.sqrt(jnp.mean(jnp.square(gradient)) + 1e-8)
+            if use_total_budget:
+                # The head predicts one budget for the complete inference
+                # call.  It does not get multiplied once per inner step.
+                direction = -gradient / gradient_rms
+            elif (
+                trust_radius is not None
+                and getattr(self.model, "magnitude_head", None) is not None
+            ):
+                magnitude = self.model.predict_update_magnitude(
+                    current, observation, omega, trust_radius
+                )
+                direction = -magnitude * gradient / gradient_rms
+            else:
+                # Backward compatibility for policies trained with one global
+                # conversion scale before the bounded magnitude head existed.
+                log_update_scale = getattr(self.model, "log_update_scale", None)
+                update_scale = (
+                    jnp.exp(log_update_scale.value)
+                    if log_update_scale is not None
+                    else jnp.asarray(1.0)
+                )
+                direction = -update_scale * gradient
             rms = jnp.sqrt(jnp.mean(jnp.square(direction)) + 1e-8)
             if trust_radius is None:
                 # Backward-compatible behavior for old checkpoints.
@@ -103,22 +137,31 @@ class CompositionalEnergyPolicy:
             velocity = self.momentum * velocity + (1.0 - self.momentum) * direction
             proposed = current + self.step_size * velocity
             if trust_radius is not None:
-                # Project the *total* displacement from this inference call's
-                # warm-start plan into an RMS ball.  Repeated optimizer steps
-                # therefore cannot accumulate beyond the trusted local region.
+                radius = (
+                    total_budget
+                    * (step_index.astype(total_budget.dtype) + 1.0)
+                    / float(self.num_steps)
+                    if use_total_budget
+                    else trust_radius
+                )
+                # Grow the learned total-call budget progressively.  This
+                # prevents the first inner step from consuming the entire
+                # displacement while guaranteeing the final RMS bound.
                 displacement = proposed - trust_anchor
                 displacement_rms = jnp.sqrt(
                     jnp.mean(jnp.square(displacement)) + 1e-8
                 )
                 displacement = displacement * jnp.minimum(
-                    1.0, trust_radius / displacement_rms
+                    1.0, radius / displacement_rms
                 )
                 proposed = trust_anchor + displacement
             current = jnp.clip(proposed, -1.0, 1.0)
             return (current, velocity), None
 
         (plan, _), _ = jax.lax.scan(
-            optimize, (plan, jnp.zeros_like(plan)), xs=None, length=self.num_steps
+            optimize,
+            (plan, jnp.zeros_like(plan)),
+            xs=jnp.arange(self.num_steps),
         )
         return plan * act_scale + act_mean
 

@@ -101,6 +101,95 @@ def _concat_datasets(datasets):
     ]
 
 
+def _summarize_rollout_records(
+    records,
+    steps,
+    minimum_mean_vx=None,
+    common_seeds=False,
+    worst_mode_selection=False,
+):
+    """Aggregate rollout records and optionally rank by the worst mode."""
+    if minimum_mean_vx is None:
+        qualifies = [True for _ in records]
+    else:
+        qualifies = [r["mean_vx"] >= minimum_mean_vx for r in records]
+    for record, qualifies_speed in zip(records, qualifies):
+        record["meets_minimum_speed"] = bool(qualifies_speed)
+
+    def summarize(subset):
+        mean_steps = float(np.mean([r["survived_steps"] for r in subset]))
+        survival_rate = float(np.mean([not r["fell"] for r in subset]))
+        qualified_mean_steps = float(
+            np.mean(
+                [
+                    r["survived_steps"] if r["meets_minimum_speed"] else 0
+                    for r in subset
+                ]
+            )
+        )
+        qualified_survival_rate = float(
+            np.mean(
+                [
+                    not r["fell"] and r["meets_minimum_speed"]
+                    for r in subset
+                ]
+            )
+        )
+        tracking = float(np.mean([r["tracking_rmse"] for r in subset]))
+        tilt = float(np.mean([r["mean_tilt"] for r in subset]))
+        jerk = float(np.mean([r["action_jerk"] for r in subset]))
+        score = (
+            qualified_mean_steps
+            + steps * qualified_survival_rate
+            - 10 * tracking
+            - tilt
+            - jerk
+        )
+        return {
+            "selection_score": score,
+            "mean_survived_steps": mean_steps,
+            "survival_rate": survival_rate,
+            "qualified_mean_survived_steps": qualified_mean_steps,
+            "qualified_survival_rate": qualified_survival_rate,
+            "tracking_rmse": tracking,
+            "mean_tilt": tilt,
+            "action_jerk": jerk,
+        }
+
+    aggregate = summarize(records)
+    mode_metrics = []
+    for mode_idx in sorted({record["mode"] for record in records}):
+        mode_summary = summarize(
+            [record for record in records if record["mode"] == mode_idx]
+        )
+        mode_summary["mode"] = mode_idx
+        mode_metrics.append(mode_summary)
+    selection_score = (
+        min(metric["selection_score"] for metric in mode_metrics)
+        if worst_mode_selection
+        else aggregate["selection_score"]
+    )
+    return {
+        "selection_score": selection_score,
+        "mean_survived_steps": aggregate["mean_survived_steps"],
+        "survival_rate": aggregate["survival_rate"],
+        "qualified_mean_survived_steps": aggregate[
+            "qualified_mean_survived_steps"
+        ],
+        "qualified_survival_rate": aggregate["qualified_survival_rate"],
+        "minimum_mean_vx": minimum_mean_vx,
+        "tracking_rmse": aggregate["tracking_rmse"],
+        "mean_tilt": aggregate["mean_tilt"],
+        "action_jerk": aggregate["action_jerk"],
+        "selection_common_seeds": common_seeds,
+        "selection_aggregation": (
+            "worst_mode" if worst_mode_selection else "mean"
+        ),
+        "mode_metrics": mode_metrics,
+        "rollouts": records,
+    }
+
+
 def _rollout_metrics(
     env,
     policy,
@@ -109,6 +198,8 @@ def _rollout_metrics(
     seeds,
     minimum_mean_vx=None,
     track_command=False,
+    common_seeds=False,
+    worst_mode_selection=False,
 ):
     reset = jax.jit(env.reset)
     step = jax.jit(env.step)
@@ -121,7 +212,8 @@ def _rollout_metrics(
             )
         )
         for seed in range(seeds):
-            rng = jax.random.PRNGKey(10_000 + 97 * mode_idx + seed)
+            seed_offset = seed if common_seeds else 97 * mode_idx + seed
+            rng = jax.random.PRNGKey(10_000 + seed_offset)
             state = _set_mode(reset(rng), omega)
             plan = jnp.zeros((policy.model.horizon, env.action_size))
             velocities = []
@@ -196,45 +288,13 @@ def _rollout_metrics(
                     "action_jerk": jerk,
                 }
             )
-    mean_steps = float(np.mean([r["survived_steps"] for r in records]))
-    survival_rate = float(np.mean([not r["fell"] for r in records]))
-    if minimum_mean_vx is None:
-        qualifies = [True for _ in records]
-    else:
-        qualifies = [r["mean_vx"] >= minimum_mean_vx for r in records]
-    for record, qualifies_speed in zip(records, qualifies):
-        record["meets_minimum_speed"] = bool(qualifies_speed)
-    qualified_mean_steps = float(
-        np.mean(
-            [r["survived_steps"] if good else 0 for r, good in zip(records, qualifies)]
-        )
+    return _summarize_rollout_records(
+        records,
+        steps,
+        minimum_mean_vx=minimum_mean_vx,
+        common_seeds=common_seeds,
+        worst_mode_selection=worst_mode_selection,
     )
-    qualified_survival_rate = float(
-        np.mean([not r["fell"] and good for r, good in zip(records, qualifies)])
-    )
-    tracking = float(np.mean([r["tracking_rmse"] for r in records]))
-    tilt = float(np.mean([r["mean_tilt"] for r in records]))
-    jerk = float(np.mean([r["action_jerk"] for r in records]))
-    # Survival dominates the ordering; locomotion quality breaks ties.
-    selection_score = (
-        qualified_mean_steps
-        + steps * qualified_survival_rate
-        - 10 * tracking
-        - tilt
-        - jerk
-    )
-    return {
-        "selection_score": selection_score,
-        "mean_survived_steps": mean_steps,
-        "survival_rate": survival_rate,
-        "qualified_mean_survived_steps": qualified_mean_steps,
-        "qualified_survival_rate": qualified_survival_rate,
-        "minimum_mean_vx": minimum_mean_vx,
-        "tracking_rmse": tracking,
-        "mean_tilt": tilt,
-        "action_jerk": jerk,
-        "rollouts": records,
-    }
 
 
 def main() -> None:
