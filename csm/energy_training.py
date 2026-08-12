@@ -57,97 +57,21 @@ def _deployment_strata(
     return tuple(result)
 
 
-def _recovery_strata(
-    difficulty: jax.Array,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Rank queries into an exact 25/25/50 easy/boundary/hard split."""
-    values = np.asarray(difficulty).reshape(-1)
-    indices = np.argsort(values, kind="stable").astype(np.int32)
-    count = len(indices)
-    if count == 0:
-        raise ValueError("recovery difficulty cannot be empty")
-    quarter = count // 4
-    cuts = (quarter, 2 * quarter)
-    groups = (
-        indices[: cuts[0]],
-        indices[cuts[0] : cuts[1]],
-        indices[cuts[1] :],
-    )
-    all_indices = np.arange(count, dtype=np.int32)
-    return tuple(group if len(group) else all_indices for group in groups)
-
-
-def _joint_deployment_strata(
-    updates: jax.Array,
-    difficulty: jax.Array,
-    radius: float,
-) -> tuple[tuple[np.ndarray, ...], ...]:
-    """Cross recovery rank with teacher-update magnitude strata."""
-    magnitude = _deployment_strata(updates, radius)
-    recovery = _recovery_strata(difficulty)
-    all_indices = np.arange(len(difficulty), dtype=np.int32)
-    rows = []
-    for recovery_pool in recovery:
-        cells = []
-        for magnitude_pool in magnitude:
-            intersection = np.intersect1d(
-                recovery_pool, magnitude_pool, assume_unique=False
-            ).astype(np.int32)
-            if len(intersection):
-                cells.append(intersection)
-            elif len(recovery_pool):
-                cells.append(recovery_pool)
-            elif len(magnitude_pool):
-                cells.append(magnitude_pool)
-            else:
-                cells.append(all_indices)
-        rows.append(tuple(cells))
-    return tuple(rows)
-
-
-def _stratum_counts(batch_size: int) -> tuple[int, int, int]:
-    quarter = batch_size // 4
-    return quarter, quarter, batch_size - 2 * quarter
-
-
-def _joint_stratum_counts(batch_size: int) -> np.ndarray:
-    """Integer 3x3 allocation with 25/25/50 row and column marginals."""
-    marginals = np.asarray(_stratum_counts(batch_size), dtype=np.int32)
-    expected = np.outer(marginals, marginals) / max(batch_size, 1)
-    counts = np.floor(expected).astype(np.int32)
-    row_remaining = marginals - counts.sum(axis=1)
-    column_remaining = marginals - counts.sum(axis=0)
-    while int(row_remaining.sum()):
-        candidates = [
-            (expected[row, column] - counts[row, column], row, column)
-            for row in range(3)
-            for column in range(3)
-            if row_remaining[row] and column_remaining[column]
-        ]
-        _, row, column = max(candidates)
-        counts[row, column] += 1
-        row_remaining[row] -= 1
-        column_remaining[column] -= 1
-    return counts
-
-
 def _sample_stratified_deployment_indices(
     rng: jax.Array,
-    strata: tuple[tuple[np.ndarray, ...], ...],
+    strata: tuple[np.ndarray, np.ndarray, np.ndarray],
     batch_size: int,
 ) -> jax.Array:
-    """Sample joint 25/25/50 recovery and magnitude marginals."""
-    counts = _joint_stratum_counts(batch_size)
-    keys = iter(jax.random.split(rng, 9))
+    """Sample an exact 25/25/50 low/boundary/saturated deployment mix."""
+    quarter = batch_size // 4
+    counts = (quarter, quarter, batch_size - 2 * quarter)
+    keys = jax.random.split(rng, 3)
     chunks = []
-    for row in range(3):
-        for column in range(3):
-            key = next(keys)
-            count = int(counts[row, column])
-            if count:
-                pool = jnp.asarray(strata[row][column])
-                selected = jax.random.randint(key, (count,), 0, len(pool))
-                chunks.append(pool[selected])
+    for key, indices, count in zip(keys, strata, counts, strict=True):
+        if count:
+            pool = jnp.asarray(indices)
+            selected = jax.random.randint(key, (count,), 0, len(indices))
+            chunks.append(pool[selected])
     return jnp.concatenate(chunks)
 
 
@@ -166,9 +90,6 @@ def fit_compositional_energy(
     sobolev_weight: float = 0.1,
     deployment_weight: float = 0.2,
     deployment_direction_weight: float = 0.3,
-    conditional_magnitude_weight: float = 0.1,
-    conditional_magnitude_cosine: float = 0.7,
-    conditional_magnitude_temperature: float = 0.1,
     deployment_batch_size: int = 8,
     sobolev_influence_cap: float | None = 2.0,
     trust_radius: float | None = 0.05,
@@ -199,8 +120,6 @@ def fit_compositional_energy(
         raise ValueError("bounded magnitude models require a positive trust radius")
     if deployment_batch_size < 1:
         raise ValueError("deployment batch size must be positive")
-    if conditional_magnitude_temperature <= 0.0:
-        raise ValueError("conditional magnitude temperature must be positive")
     if closed_loop_every < 1:
         raise ValueError("closed-loop frequency must be positive")
     if closed_loop_batch_size < 1:
@@ -213,11 +132,7 @@ def fit_compositional_energy(
         closed_loop_groups = list(closed_loop_dataset)
     strata_radius = float(trust_radius) if trust_radius is not None else np.inf
     deployment_strata = [
-        _joint_deployment_strata(
-            group.guidance_updates,
-            group.guidance_recovery_difficulty,
-            strata_radius,
-        )
+        _deployment_strata(group.guidance_updates, strata_radius)
         for group in groups
     ]
 
@@ -420,26 +335,6 @@ def fit_compositional_energy(
             )
         )
         deployment_direction_loss = jnp.mean(1.0 - final_dot / final_denom)
-        final_cosine = final_dot / final_denom
-        direction_ready = jax.lax.stop_gradient(
-            jax.nn.sigmoid(
-                (final_cosine - conditional_magnitude_cosine)
-                / conditional_magnitude_temperature
-            )
-        )
-        saturated = jax.lax.stop_gradient(
-            (target_final_rms >= 0.8 * float(trust_radius)).astype(
-                target_final_rms.dtype
-            )
-        )
-        conditional_weights = direction_ready * saturated
-        magnitude_underprediction = jnp.square(
-            jax.nn.relu(target_final_rms - predicted_final_rms)
-            / max(float(trust_radius), 1e-3)
-        )
-        conditional_magnitude_loss = jnp.sum(
-            conditional_weights * magnitude_underprediction
-        ) / (jnp.sum(conditional_weights) + 1e-6)
         deployment_per_sample = jnp.mean(
             optax_huber(
                 (predicted_deployment_update - target_deployment_update)
@@ -471,7 +366,6 @@ def fit_compositional_energy(
             + calibration_weight * calibration_loss
             + sobolev_weight * sobolev_loss
             + deployment_direction_weight * deployment_direction_loss
-            + conditional_magnitude_weight * conditional_magnitude_loss
             + deployment_weight * deployment_loss
         )
 

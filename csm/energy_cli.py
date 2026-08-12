@@ -6,7 +6,6 @@ import argparse
 import json
 import shutil
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -14,7 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from brax import envs as brax_envs
-from brax import math as brax_math
 from brax.io import html
 from flax import nnx
 from tqdm.auto import tqdm
@@ -112,35 +110,6 @@ def _dagger_beta_schedule(rounds, mixed_beta, student_only_rounds):
     ] * student_only_rounds
 
 
-def _state_recovery_difficulty(env, state) -> tuple[float, bool]:
-    """Return a dimensionless physical-risk score and recoverability flag."""
-    torso = int(env._torso_idx) - 1
-    rotation = state.pipeline_state.x.rot[torso]
-    euler = brax_math.quat_to_euler(rotation)
-    tilt = float(jnp.linalg.norm(euler[:2]))
-    height = float(state.pipeline_state.x.pos[torso, 2])
-    angular_speed = float(
-        jnp.linalg.norm(state.pipeline_state.xd.ang[torso] * jnp.pi / 180.0)
-    )
-    tilt_risk = np.clip(tilt / (0.5 * np.pi), 0.0, 1.5)
-    height_risk = np.clip((0.30 - height) / 0.12, 0.0, 1.5)
-    angular_risk = np.clip(angular_speed / 4.0, 0.0, 1.5)
-    score = 0.55 * tilt_risk + 0.25 * height_risk + 0.20 * angular_risk
-    recoverable = height > 0.20 and tilt < 1.25
-    return float(score), bool(recoverable)
-
-
-def _annotate_recovery_difficulty(dataset, state_score, trust_radius):
-    """Combine physical risk with the bounded teacher correction size."""
-    update = dataset.guidance_updates.at[:, 0].set(0.0)
-    update_rms = jnp.sqrt(jnp.mean(jnp.square(update), axis=(-2, -1)) + 1e-8)
-    correction = jnp.clip(update_rms / max(float(trust_radius), 1e-6), 0.0, 2.0)
-    return replace(
-        dataset,
-        guidance_recovery_difficulty=jnp.asarray(state_score) + correction,
-    )
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -220,24 +189,6 @@ def _parser() -> argparse.ArgumentParser:
         help="cosine loss weight for the final unrolled deployment update",
     )
     parser.add_argument(
-        "--conditional-magnitude-weight",
-        type=float,
-        default=0.1,
-        help="under-predicted saturated-update magnitude loss weight",
-    )
-    parser.add_argument(
-        "--conditional-magnitude-cosine",
-        type=float,
-        default=0.7,
-        help="direction cosine where hard-query magnitude supervision turns on",
-    )
-    parser.add_argument(
-        "--conditional-magnitude-temperature",
-        type=float,
-        default=0.1,
-        help="soft direction gate temperature for conditional magnitude loss",
-    )
-    parser.add_argument(
         "--deployment-batch-size",
         type=int,
         default=8,
@@ -277,17 +228,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-every", type=int, default=5_000)
     parser.add_argument("--selection-steps", type=int, default=300)
     parser.add_argument("--selection-seeds", type=int, default=2)
-    parser.add_argument("--final-selection-steps", type=int, default=500)
-    parser.add_argument("--final-selection-seeds", type=int, default=10)
-    parser.add_argument("--selection-finalists", type=int, default=5)
-    parser.add_argument("--hard-recovery-steps", type=int, default=500)
-    parser.add_argument("--hard-recovery-window", type=int, default=24)
-    parser.add_argument("--hard-recovery-queries-per-mode", type=int, default=64)
-    parser.add_argument("--hard-recovery-teacher-repeats", type=int, default=16)
-    parser.add_argument("--hard-recovery-train-iters", type=int, default=5_000)
-    parser.add_argument("--hard-recovery-learning-rate", type=float, default=1e-5)
-    parser.add_argument("--hard-recovery-eval-every", type=int, default=1_000)
-    parser.add_argument("--hard-recovery-early-stop-patience", type=int, default=2)
     parser.add_argument("--eval-steps", type=int, default=500)
     parser.add_argument("--smoke", action="store_true")
     return parser
@@ -304,7 +244,6 @@ def _collect_base(
     regular_factors,
     collect_steps,
     episode_lengths,
-    trust_radius,
     rng,
 ):
     chunks = []
@@ -346,19 +285,10 @@ def _collect_base(
                 rng, episode_limit = _sample_episode_limit(rng, episode_lengths)
                 episode_limits[mode_idx] = episode_limit
             plan = planner.shift(plan)
-            state_difficulty, _ = _state_recovery_difficulty(env, state)
             factors = initial_factors if state_idx == 0 else regular_factors
             for factor in factors:
-                chunk, plan, rng = collector.collect_query_with_difficulty(
-                    state,
-                    plan,
-                    float(factor),
-                    rng,
-                    omega,
-                    state_difficulty,
-                )
-                chunk = _annotate_recovery_difficulty(
-                    chunk, state_difficulty, trust_radius
+                chunk, plan, rng = collector.collect_query(
+                    state, plan, float(factor), rng, omega
                 )
                 chunk.costs.block_until_ready()
                 chunks.append(chunk)
@@ -384,7 +314,6 @@ def _collect_dagger(
     rng,
     round_idx,
     closed_loop_steps,
-    trust_radius,
 ):
     chunks = []
     closed_loop_chunks = []
@@ -442,18 +371,9 @@ def _collect_dagger(
             rng, policy_rng = jax.random.split(rng)
             learner = apply(shifted, state.obs, policy_rng, omega)
             teacher_plan = learner
-            state_difficulty, _ = _state_recovery_difficulty(env, state)
             for factor in regular_factors:
-                chunk, teacher_plan, rng = collector.collect_query_with_difficulty(
-                    state,
-                    teacher_plan,
-                    float(factor),
-                    rng,
-                    omega,
-                    state_difficulty,
-                )
-                chunk = _annotate_recovery_difficulty(
-                    chunk, state_difficulty, trust_radius
+                chunk, teacher_plan, rng = collector.collect_query(
+                    state, teacher_plan, float(factor), rng, omega
                 )
                 chunk.costs.block_until_ready()
                 chunks.append(chunk)
@@ -470,93 +390,6 @@ def _collect_dagger(
         concatenate_closed_loop_datasets(closed_loop_chunks),
         rng,
     )
-
-
-def _collect_hard_recovery(
-    env,
-    planner,
-    collector,
-    policy,
-    reset,
-    step,
-    mode_weights,
-    rollout_steps,
-    recovery_window,
-    queries_per_mode,
-    factor,
-    trust_radius,
-    rng,
-):
-    """Relabel recoverable student states nearest to failure with DIAL."""
-    apply = jax.jit(
-        lambda plan, obs, key, omega: policy.apply(
-            plan, obs, key, warm_start_level=1.0, omega=omega
-        )
-    )
-    selected = []
-    rollout_bar = tqdm(
-        total=rollout_steps * len(mode_weights),
-        desc="Hard recovery state search",
-        unit="state",
-    )
-    for omega in mode_weights:
-        rng, key = jax.random.split(rng)
-        state = _set_mode(reset(key), omega)
-        plan = jnp.zeros((planner.args.Hnode + 1, env.action_size))
-        episode_records = []
-        candidates = []
-        for _ in range(rollout_steps):
-            state = step(_set_mode(state, omega), plan[0])
-            state.reward.block_until_ready()
-            if _physically_fallen(env, state):
-                recent = episode_records[-recovery_window:]
-                for distance, record in enumerate(reversed(recent)):
-                    proximity = 1.0 - distance / max(len(recent), 1)
-                    record["difficulty"] += 2.0 * proximity
-                rng, key = jax.random.split(rng)
-                state = _set_mode(reset(key), omega)
-                plan = jnp.zeros_like(plan)
-                episode_records = []
-                rollout_bar.update()
-                continue
-            shifted = planner.shift(plan)
-            rng, policy_rng = jax.random.split(rng)
-            learner = apply(shifted, state.obs, policy_rng, omega)
-            physical_risk, recoverable = _state_recovery_difficulty(env, state)
-            if recoverable:
-                record = {
-                    "state": state,
-                    "query": learner,
-                    "omega": jnp.asarray(omega),
-                    "difficulty": physical_risk,
-                }
-                candidates.append(record)
-                episode_records.append(record)
-            plan = learner
-            rollout_bar.update()
-        candidates.sort(key=lambda record: record["difficulty"], reverse=True)
-        selected.extend(candidates[:queries_per_mode])
-    rollout_bar.close()
-    if not selected:
-        raise RuntimeError("hard recovery search found no recoverable student states")
-
-    chunks = []
-    relabel_bar = tqdm(selected, desc="Hard recovery DIAL relabel", unit="query")
-    for record in relabel_bar:
-        chunk, _, rng = collector.collect_query_with_difficulty(
-            record["state"],
-            record["query"],
-            factor,
-            rng,
-            record["omega"],
-            record["difficulty"],
-        )
-        chunk = _annotate_recovery_difficulty(
-            chunk, record["difficulty"], trust_radius
-        )
-        chunk.costs.block_until_ready()
-        chunks.append(chunk)
-    return concatenate_energy_datasets(chunks), rng
 
 
 def _balanced_cost_statistics(datasets):
@@ -609,16 +442,6 @@ def main() -> None:
         args.checkpoint_every = 1
         args.selection_steps = 2
         args.selection_seeds = 1
-        args.final_selection_steps = 2
-        args.final_selection_seeds = 1
-        args.selection_finalists = 1
-        args.hard_recovery_steps = 2
-        args.hard_recovery_window = 1
-        args.hard_recovery_queries_per_mode = 1
-        args.hard_recovery_teacher_repeats = 1
-        args.hard_recovery_train_iters = 2
-        args.hard_recovery_eval_every = 1
-        args.hard_recovery_early_stop_patience = 1
         args.eval_steps = 2
 
     episode_lengths = args.collection_episode_lengths
@@ -657,7 +480,6 @@ def main() -> None:
     if (
         args.deployment_weight < 0.0
         or args.deployment_direction_weight < 0.0
-        or args.conditional_magnitude_weight < 0.0
         or args.closed_loop_weight < 0.0
     ):
         raise ValueError(
@@ -665,10 +487,6 @@ def main() -> None:
         )
     if args.deployment_batch_size < 1:
         raise ValueError("deployment batch size must be positive")
-    if not -1.0 <= args.conditional_magnitude_cosine <= 1.0:
-        raise ValueError("conditional magnitude cosine must be in [-1, 1]")
-    if args.conditional_magnitude_temperature <= 0.0:
-        raise ValueError("conditional magnitude temperature must be positive")
     if args.trust_radius <= 0.0:
         raise ValueError("trust radius must be positive")
     if args.student_only_learning_rate <= 0.0:
@@ -689,23 +507,6 @@ def main() -> None:
         raise ValueError("closed-loop discount must be in (0, 1]")
     if args.collection_episode_steps < 0:
         raise ValueError("collection episode steps must be non-negative")
-    positive_integer_options = {
-        "final selection steps": args.final_selection_steps,
-        "final selection seeds": args.final_selection_seeds,
-        "selection finalists": args.selection_finalists,
-        "hard recovery steps": args.hard_recovery_steps,
-        "hard recovery window": args.hard_recovery_window,
-        "hard recovery queries per mode": args.hard_recovery_queries_per_mode,
-        "hard recovery teacher repeats": args.hard_recovery_teacher_repeats,
-        "hard recovery train iterations": args.hard_recovery_train_iters,
-        "hard recovery evaluation interval": args.hard_recovery_eval_every,
-        "hard recovery early-stop patience": args.hard_recovery_early_stop_patience,
-    }
-    for name, value in positive_integer_options.items():
-        if value < 1:
-            raise ValueError(f"{name} must be positive")
-    if args.hard_recovery_learning_rate <= 0.0:
-        raise ValueError("hard recovery learning rate must be positive")
     dagger_beta_schedule = _dagger_beta_schedule(
         args.dagger_rounds,
         args.dagger_beta,
@@ -770,7 +571,6 @@ def main() -> None:
             regular_factors,
             args.collect_steps,
             episode_lengths,
-            args.trust_radius,
             rng,
         )
     save_energy_dataset(run_dir / "energy_data.npz", base)
@@ -832,8 +632,8 @@ def main() -> None:
                 env,
                 make_policy(),
                 mode_weights,
-                early_stop_context.get("selection_steps", args.selection_steps),
-                early_stop_context.get("selection_seeds", args.selection_seeds),
+                args.selection_steps,
+                args.selection_seeds,
                 minimum_mean_vx=args.minimum_mean_vx,
                 track_command=args.selection_track_command,
                 common_seeds=True,
@@ -851,9 +651,7 @@ def main() -> None:
                 early_stop_context["stale"] += 1
             should_stop = (
                 early_stop_context["stale"]
-                >= early_stop_context.get(
-                    "patience", args.student_only_early_stop_patience
-                )
+                >= args.student_only_early_stop_patience
             )
         path.with_name("metadata.json").write_text(
             json.dumps(metadata, indent=2),
@@ -880,11 +678,6 @@ def main() -> None:
             sobolev_weight=args.sobolev_weight,
             deployment_weight=args.deployment_weight,
             deployment_direction_weight=args.deployment_direction_weight,
-            conditional_magnitude_weight=args.conditional_magnitude_weight,
-            conditional_magnitude_cosine=args.conditional_magnitude_cosine,
-            conditional_magnitude_temperature=(
-                args.conditional_magnitude_temperature
-            ),
             deployment_batch_size=args.deployment_batch_size,
             sobolev_influence_cap=args.sobolev_influence_cap,
             trust_radius=args.trust_radius,
@@ -973,7 +766,6 @@ def main() -> None:
                 rng,
                 round_zero + 1,
                 horizon_for_round,
-                args.trust_radius,
             )
             round_dagger_chunks.append(dagger_chunk)
             round_closed_loop_chunks.append(closed_loop_chunk)
@@ -1094,91 +886,11 @@ def main() -> None:
         make_policy().save(final_path)
         checkpoints.append(final_path)
 
-    phase = "hard_recovery"
-    recovery_collector = ExactEnergyCollector(
-        planner,
-        objective_spec.cost,
-        num_candidates=args.energy_candidates,
-        teacher_repeats=args.hard_recovery_teacher_repeats,
-    )
-    recovery_dataset, rng = _collect_hard_recovery(
-        env,
-        planner,
-        recovery_collector,
-        make_policy(),
-        reset,
-        step,
-        mode_weights,
-        args.hard_recovery_steps,
-        args.hard_recovery_window,
-        args.hard_recovery_queries_per_mode,
-        float(regular_factors[0]),
-        args.trust_radius,
-        rng,
-    )
-    save_energy_dataset(run_dir / "hard_recovery_relabel.npz", recovery_dataset)
-    recovery_groups = [base, *dagger_sets, recovery_dataset]
-    new_mean, new_std = _balanced_cost_statistics(recovery_groups)
-    _reparameterize_energy_normalization(
-        model, cost_mean, cost_std, new_mean, new_std
-    )
-    cost_mean, cost_std = new_mean, new_std
-    optimizer = make_optimizer(args.hard_recovery_learning_rate)
-    early_stop_context = {
-        "best_score": -np.inf,
-        "best_path": None,
-        "last_score": None,
-        "last_path": None,
-        "stale": 0,
-        "patience": args.hard_recovery_early_stop_patience,
-        "selection_steps": args.final_selection_steps,
-        "selection_seeds": args.final_selection_seeds,
-    }
-    recovery_start_step = global_step
-    train(
-        recovery_groups,
-        args.hard_recovery_train_iters,
-        closed_loop=closed_loop_sets,
-        checkpoint_interval=min(
-            args.hard_recovery_eval_every, args.hard_recovery_train_iters
-        ),
-    )
-    recovery_best_path = early_stop_context["best_path"]
-    recovery_best_score = early_stop_context["best_score"]
-    if recovery_best_path is not None:
-        restored = CompositionalEnergyPolicy.load(recovery_best_path)
-        model = restored.model
-        normalizer = restored.normalizer
-        cost_mean = restored.cost_mean
-        cost_std = restored.cost_std
-    early_stop_context = None
-    recovery_final_path = (
-        checkpoints_dir / f"step_{global_step:06d}_{phase}_final" / "policy.pkl"
-    )
-    make_policy().save(recovery_final_path)
-    checkpoints.append(recovery_final_path)
-    recovery_training_history = {
-        "rollout_steps_per_mode": args.hard_recovery_steps,
-        "queries_per_mode": args.hard_recovery_queries_per_mode,
-        "collected_queries": int(recovery_dataset.guidance_plans.shape[0]),
-        "teacher_repeats": args.hard_recovery_teacher_repeats,
-        "learning_rate": args.hard_recovery_learning_rate,
-        "requested_gradient_steps": args.hard_recovery_train_iters,
-        "completed_gradient_steps": global_step - recovery_start_step,
-        "restored_best_checkpoint": (
-            str(recovery_best_path) if recovery_best_path is not None else None
-        ),
-        "best_500_step_score": (
-            float(recovery_best_score)
-            if recovery_best_path is not None
-            else None
-        ),
-    }
-
-    screening = []
+    selection = []
+    best = None
     for path in tqdm(
         list(dict.fromkeys(checkpoints)),
-        desc="Energy checkpoint screening",
+        desc="Energy rollout checkpoint selection",
         unit="checkpoint",
     ):
         candidate = CompositionalEnergyPolicy.load(path)
@@ -1194,46 +906,12 @@ def main() -> None:
             worst_mode_selection=True,
         )
         metrics["policy"] = str(path)
-        screening.append(metrics)
-    finalists = sorted(
-        screening, key=lambda item: item["selection_score"], reverse=True
-    )[: min(args.selection_finalists, len(screening))]
-    final_selection = []
-    best = None
-    for screened in tqdm(
-        finalists,
-        desc="500-step finalist selection",
-        unit="checkpoint",
-    ):
-        path = Path(screened["policy"])
-        candidate = CompositionalEnergyPolicy.load(path)
-        metrics = _rollout_metrics(
-            env,
-            candidate,
-            mode_weights,
-            args.final_selection_steps,
-            args.final_selection_seeds,
-            minimum_mean_vx=args.minimum_mean_vx,
-            track_command=args.selection_track_command,
-            common_seeds=True,
-            worst_mode_selection=True,
-        )
-        metrics["policy"] = str(path)
-        metrics["screening_score"] = screened["selection_score"]
-        final_selection.append(metrics)
+        selection.append(metrics)
         if best is None or metrics["selection_score"] > best[0]:
             best = (metrics["selection_score"], path, metrics)
     assert best is not None
     (run_dir / "checkpoint_selection.json").write_text(
-        json.dumps(
-            {
-                "screening": screening,
-                "finalists": final_selection,
-                "selected": best[2],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+        json.dumps(selection, indent=2), encoding="utf-8"
     )
     shutil.copy2(best[1], run_dir / "policy.pkl")
 
@@ -1275,15 +953,7 @@ def main() -> None:
         "resolved_closed_loop_horizons": closed_loop_horizons,
         "selection_common_seeds": True,
         "selection_aggregation": "worst_mode",
-        "selection_pipeline": {
-            "screening_steps": args.selection_steps,
-            "screening_seeds": args.selection_seeds,
-            "finalists": args.selection_finalists,
-            "final_steps": args.final_selection_steps,
-            "final_seeds": args.final_selection_seeds,
-        },
         "dagger_training_history": dagger_training_history,
-        "hard_recovery_training_history": recovery_training_history,
         "environment_randomization": {
             key: value
             for key, value in config.items()

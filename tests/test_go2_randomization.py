@@ -20,10 +20,7 @@ from csm.energy_policy import CompositionalEnergyPolicy
 from csm.exact_cli import _summarize_rollout_records
 from csm.energy_training import (
     _deployment_strata,
-    _joint_deployment_strata,
-    _joint_stratum_counts,
     _project_rms,
-    _recovery_strata,
     _sample_influence,
     _sample_stratified_deployment_indices,
 )
@@ -138,43 +135,24 @@ class Go2RandomizationTest(unittest.TestCase):
         np.testing.assert_allclose(influence, jnp.array([1.0, 0.2]), rtol=1e-5)
         np.testing.assert_allclose(directions[1], 10.0)
 
-    def test_deployment_sampling_balances_magnitude_and_recovery(self):
-        updates = jnp.zeros((12, 2, 1))
+    def test_deployment_sampling_balances_magnitude_strata(self):
+        updates = jnp.zeros((6, 2, 1))
         updates = updates.at[:, 1, 0].set(
-            jnp.array(
-                [
-                    0.02,
-                    0.065,
-                    0.09,
-                    0.02,
-                    0.065,
-                    0.09,
-                    0.02,
-                    0.065,
-                    0.09,
-                    0.02,
-                    0.065,
-                    0.09,
-                ]
-            )
+            jnp.array([0.02, 0.03, 0.06, 0.065, 0.08, 0.09])
         )
-        difficulty = jnp.arange(12, dtype=jnp.float32)
-        magnitude = _deployment_strata(updates, radius=0.05)
-        recovery = _recovery_strata(difficulty)
-        strata = _joint_deployment_strata(updates, difficulty, radius=0.05)
-        counts = _joint_stratum_counts(8)
-        np.testing.assert_array_equal(counts.sum(axis=0), [2, 2, 4])
-        np.testing.assert_array_equal(counts.sum(axis=1), [2, 2, 4])
+        strata = _deployment_strata(updates, radius=0.05)
+        np.testing.assert_array_equal(strata[0], [0, 1])
+        np.testing.assert_array_equal(strata[1], [2, 3])
+        np.testing.assert_array_equal(strata[2], [4, 5])
         sampled = np.asarray(
             _sample_stratified_deployment_indices(
                 jax.random.PRNGKey(3), strata, batch_size=8
             )
         )
         self.assertEqual(len(sampled), 8)
-        magnitude_counts = [np.isin(sampled, pool).sum() for pool in magnitude]
-        recovery_counts = [np.isin(sampled, pool).sum() for pool in recovery]
-        self.assertEqual(magnitude_counts, [2, 2, 4])
-        self.assertEqual(recovery_counts, [2, 2, 4])
+        self.assertTrue(np.all(np.isin(sampled[:2], strata[0])))
+        self.assertTrue(np.all(np.isin(sampled[2:4], strata[1])))
+        self.assertTrue(np.all(np.isin(sampled[4:], strata[2])))
 
     def test_checkpoint_selection_uses_worst_mode_score(self):
         records = []

@@ -54,11 +54,8 @@ supervision for the composed energy.
   targets.  Magnitude, cosine-direction, and vector deployment losses must act
   on the result of the complete differentiable inference unroll, not directly
   on the magnitude-head scalar.  Draw that sub-batch as a 25/25/50 mixture of
-  low, boundary, and saturated teacher magnitudes, crossed with a 25/25/50
-  easy, boundary, and hard recovery-rank mixture.  Base and each DAgger round
-  must be sampled equally.  On saturated targets, penalize magnitude
-  under-prediction only after a stop-gradient cosine gate confirms that the
-  final student update points sufficiently close to the teacher direction.
+  low, boundary, and saturated teacher magnitudes.  Base and each DAgger round
+  must be sampled equally.
 - DAgger stores boundary-safe temporal windows with a per-round horizon
   curriculum.  Multi-step training rolls the student plan forward through
   `apply -> shift -> apply` while treating the recorded observations as
@@ -68,10 +65,6 @@ supervision for the composed energy.
   validation checkpoint, and recollect exact DIAL targets from that current
   student before every cycle; never continue collection from the last
   optimizer iterate by default.
-- After ordinary DAgger, search student-only rollouts for recoverable states
-  immediately preceding falls, relabel the highest-risk queries with extra
-  repeated DIAL calls, and fine-tune them at a lower learning rate.  Protect
-  this hard-recovery phase with 500-step rollout early stopping.
 - Fit `StandardNormalizer` on raw observations and preserve per-objective cost
   mean/std in `CompositionalEnergyPolicy`.
 - `CompositionalEnergyPolicy.apply` normalizes the composed energy gradient
@@ -80,10 +73,8 @@ supervision for the composed energy.
   grows progressively over the inner optimizer steps; never multiply the
   magnitude once per inner step.  `shift` warm-starts the next DIAL step.
 - Rollout checkpoint selection uses the same reset/command seeds for every
-  training anchor and ranks a checkpoint by its worst anchor score.  Screen
-  every checkpoint cheaply, then rerank only the finalists at the full
-  500-step deployment horizon with more common seeds.  Unseen weights remain
-  final holdouts and must not participate in selection.
+  training anchor and ranks a checkpoint by its worst anchor score.  Unseen
+  weights remain final holdouts and must not participate in selection.
 
 ## Verification
 

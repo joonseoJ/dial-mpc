@@ -25,7 +25,6 @@ class EnergyDataset:
     guidance_updates: jax.Array
     guidance_objective_gradients: jax.Array
     guidance_gradient_valid: jax.Array
-    guidance_recovery_difficulty: jax.Array
 
 
 @dataclass
@@ -142,10 +141,6 @@ def load_energy_dataset(path: Path | str) -> EnergyDataset:
             arrays["guidance_gradient_valid"] = jnp.zeros(
                 (plans.shape[0],), dtype=jnp.float32
             )
-        if "guidance_recovery_difficulty" not in arrays:
-            arrays["guidance_recovery_difficulty"] = jnp.zeros(
-                (arrays["guidance_plans"].shape[0],), dtype=jnp.float32
-            )
         return EnergyDataset(**arrays)
 
 
@@ -226,20 +221,6 @@ class ExactEnergyCollector:
 
     def collect_query(self, state, query, factor, rng, omega) -> tuple[EnergyDataset, jax.Array, jax.Array]:
         """Collect value labels and an averaged exact-DIAL direction anchor."""
-        return self.collect_query_with_difficulty(
-            state, query, factor, rng, omega, recovery_difficulty=0.0
-        )
-
-    def collect_query_with_difficulty(
-        self,
-        state,
-        query,
-        factor,
-        rng,
-        omega,
-        recovery_difficulty,
-    ) -> tuple[EnergyDataset, jax.Array, jax.Array]:
-        """Collect one query and retain its state-level recovery priority."""
         state = self._set_weights(state, omega)
         noise_scale = self.planner.sigma_control * jnp.asarray(factor)
         refined = []
@@ -284,8 +265,5 @@ class ExactEnergyCollector:
             guidance_updates=(mean_refined - query)[None],
             guidance_objective_gradients=objective_gradients[None],
             guidance_gradient_valid=jnp.ones((1,), dtype=jnp.float32),
-            guidance_recovery_difficulty=jnp.asarray(
-                [recovery_difficulty], dtype=jnp.float32
-            ),
         )
         return dataset, mean_refined, rng

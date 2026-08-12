@@ -65,9 +65,6 @@ dial-csm --example unitree_go2_trot_randomized \
   --batch-size 256 --learning-rate 1e-4 \
   --guidance-weight 0.3 --calibration-weight 0.1 --sobolev-weight 0.2 \
   --deployment-weight 0.2 --deployment-direction-weight 0.3 \
-  --conditional-magnitude-weight 0.1 \
-  --conditional-magnitude-cosine 0.7 \
-  --conditional-magnitude-temperature 0.1 \
   --deployment-batch-size 8 \
   --sobolev-influence-cap 2.0 \
   --closed-loop-weight 0.05 \
@@ -76,16 +73,7 @@ dial-csm --example unitree_go2_trot_randomized \
   --energy-steps 8 --energy-step-size 1.0 --trust-radius 0.05 \
   --minimum-mean-vx 0.3 --selection-track-command \
   --checkpoint-every 5000 \
-  --selection-steps 300 --selection-seeds 5 \
-  --final-selection-steps 500 --final-selection-seeds 10 \
-  --selection-finalists 5 \
-  --hard-recovery-steps 500 --hard-recovery-window 24 \
-  --hard-recovery-queries-per-mode 64 \
-  --hard-recovery-teacher-repeats 16 \
-  --hard-recovery-train-iters 5000 --hard-recovery-learning-rate 1e-5 \
-  --hard-recovery-eval-every 1000 \
-  --hard-recovery-early-stop-patience 2 \
-  --eval-steps 500
+  --selection-steps 300 --selection-seeds 5 --eval-steps 500
 ```
 
 규모는 대략 다음과 같다.
@@ -96,8 +84,8 @@ dial-csm --example unitree_go2_trot_randomized \
 - value labels: query당 64개, 전체 약 154만 trajectory
 - exact objective-gradient anchors: 전체 약 2.4만 query
 - optimization 상한: base 100,000 + mixed DAgger 90,000 + student-only
-  DAgger 20,000 + hard recovery 5,000 = 총 215,000 gradient step. Student-only
-  및 hard-recovery 단계는 rollout early stopping에 따라 더 일찍 끝날 수 있다.
+  DAgger 20,000 = 총 210,000 gradient step. Student-only round는 rollout
+  early stopping에 따라 더 일찍 끝날 수 있다.
 - DAgger beta schedule: `[0.5, 0.5, 0.5, 0.0, 0.0]`
 
 ## Hard-query 및 deployment supervision
@@ -208,31 +196,6 @@ query의 영향력을 줄이는 `--sobolev-influence-cap`은 Sobolev 항에는 �
 적용하지만, 이미 trust radius로 bounded된 final magnitude/direction/vector
 loss에는 적용하지 않는다.
 
-같은 sub-batch를 physical tilt, body height, angular speed, bounded teacher
-correction 크기를 결합한 recovery difficulty 순위로도 25/25/50으로 나눈다.
-구현은 recovery 3구간과 magnitude 3구간의 3×3 joint cell에서 표본을 뽑으므로,
-각 marginal의 easy/boundary/hard 및 low/boundary/saturated 비율이 동시에
-2/2/4가 된다. 각 구간에 표본이 없는 작은 dataset에서는 가장 가까운 recovery
-또는 magnitude pool로 fallback한다.
-
-포화 target의 magnitude 과소예측은 방향이 맞기 전에는 강제로 키우지 않는다.
-최종 update cosine을 $c$라 할 때 stop-gradient gate를
-
-$$
-q=\operatorname{stopgrad}\left[\sigma\left(\frac{c-0.7}{0.1}\right)\right]
-$$
-
-로 정의하고, 다음 항을 추가한다.
-
-$$
-\mathcal L_{\mathrm{under}}
-=q\,\mathbf 1[m^*\ge0.8r]
-\left(\frac{\max(0,m^*-m_\theta)}{r}\right)^2.
-$$
-
-따라서 final direction loss가 먼저 방향을 정렬하고, 정렬된 hard query에 대해서만
-`--conditional-magnitude-weight`가 복구 update 크기를 teacher 쪽으로 올린다.
-
 ## Multi-step closed-loop supervision
 
 각 DAgger round는 기존 `dagger_round_N.npz` 외에
@@ -269,26 +232,6 @@ step과 `400` collection state/mode를 기본 evaluation interval `2,500`에 맞
 보존한다. 실제 완료 step, horizon, cycle score와 복원 checkpoint는
 `run_config.json`의 `dagger_training_history`에 기록된다.
 
-## Hard recovery relabel fine-tuning
-
-일반 DAgger가 끝나면 마지막 rollout-best 학생을 anchor별로 500 step 실행한다.
-각 episode의 최근 24개 query를 ring buffer에 유지하고 fall이 발생하면 실패에
-가까운 query일수록 recovery difficulty에 최대 2.0의 proximity bonus를 더한다.
-이미 물리적으로 넘어진 state는 제외하며 base height가 0.20 m보다 높고
-roll/pitch tilt가 1.25 rad보다 작은 복구 가능한 state만 후보로 유지한다.
-
-각 anchor에서 difficulty가 높은 64개 query를 골라 현재 학생 plan에서
-DIAL-TC-MPPI update를 16회 다시 계산해 평균한다. 이 데이터는
-`hard_recovery_relabel.npz`에 저장된다. 이후 기존 base/DAgger round와 recovery
-dataset을 각각 하나의 balanced group으로 두고 learning rate `1e-5`로 최대
-5,000 step fine-tuning한다.
-
-매 1,000 step마다 `500 step × 10 common seeds × training anchors` rollout을
-수행한다. worst-anchor score가 연속 두 번 개선되지 않으면 조기 종료하고 가장
-좋았던 recovery checkpoint를 복원한다. 상세 결과는 `run_config.json`의
-`hard_recovery_training_history`에 저장된다. Unseen weight의 state나 rollout은
-수집, early stopping, checkpoint 선택 어디에도 사용하지 않는다.
-
 첫 state에서는 initial diffusion 10개, 이후에는 regular diffusion 2개를 쓰기
 때문에 query 수가 단순히 state 수와 같지는 않다. exact MJX rollout Jacobian과
 8회 MPPI 평균 때문에 collection이 학습보다 훨씬 오래 걸릴 수 있다.
@@ -299,10 +242,8 @@ dataset을 각각 하나의 balanced group으로 두고 learning rate `1e-5`로 
 실제 $(v_x^*,v_y^*,\omega_z^*)$를 사용한다.
 
 모든 학습 anchor는 동일한 seed $s_j$로 reset되므로 mode별 초기 자세와 command
-randomization이 직접 비교 가능하다. 먼저 모든 checkpoint를 기본
-`300 step × 5 seeds`로 screening한다. 상위 5개 checkpoint만 실제 배포 horizon인
-`500 step × 10 seeds`로 다시 평가해 최종 정책을 고른다. 두 단계 모두 세 anchor
-평균이 아니라 가장 낮은 anchor score를 사용한다.
+randomization이 직접 비교 가능하다. Checkpoint의 최종 selection score는 세
+anchor 평균이 아니라 가장 낮은 anchor score다.
 
 $$
 S_{\mathrm{select}}=\min_{k\in\{1,2,3\}}S_k.
@@ -325,9 +266,6 @@ selection score의 survival, tilt, jerk 구조는 기존과 같다. forward comm
 최솟값이 0.4 m/s이므로 생존 인정 threshold만 0.3 m/s로 낮춘다. 이 옵션을
 사용하지 않으면 기존 checkpoint selector는 기존 방식대로 0.8 m/s를 기준으로
 계산한다.
-
-두 단계 결과와 최종 선택은 `checkpoint_selection.json`의 `screening`,
-`finalists`, `selected` 필드에 각각 기록된다.
 
 ## 먼저 실행할 검증
 
