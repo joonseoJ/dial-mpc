@@ -20,6 +20,7 @@ from mujoco import mjx
 from dial_mpc.envs.base_env import BaseEnv, BaseEnvConfig
 from dial_mpc.utils.function_utils import global_to_body_velocity, get_foot_step
 from dial_mpc.utils.io_utils import get_model_path
+from csm.omega import normalize_omega
 
 
 @dataclass
@@ -266,7 +267,13 @@ class UnitreeGo2Env(BaseEnv):
                 reward_gaits * 0.1,
             ]
         )
-        reward = jnp.dot(state.info["reward_weights"], reward_components)
+        # See the push-recovery env: omega carries direction only, so that the
+        # temperature is the sole scale.  DIAL's own update is invariant to the
+        # weight scale, so this changes reported reward magnitudes and nothing
+        # about the planner's behaviour.
+        reward = jnp.dot(
+            normalize_omega(state.info["reward_weights"]), reward_components
+        )
 
         # done
         up = jnp.array([0.0, 0.0, 1.0])
@@ -1016,6 +1023,9 @@ class UnitreeGo2PushRecoverEnv(UnitreeGo2Env):
         state.info["ang_vel_tar"] = jnp.zeros(3)
         state.info["push_linear"] = linear
         state.info["push_speed"] = jnp.linalg.norm(linear)
+        state.info["reward_weights"] = normalize_omega(
+            state.info["reward_weights"]
+        )
         state.info["reward_terms"] = jnp.zeros(4)
         state.info["feet_lifted"] = jnp.zeros(())
 
@@ -1066,13 +1076,19 @@ class UnitreeGo2PushRecoverEnv(UnitreeGo2Env):
         reward_components = jnp.stack(
             [reward_tilt, reward_base, reward_feet, reward_shape]
         )
-        reward = jnp.dot(state.info["reward_weights"], reward_components)
+        # Unit weights by construction: the objective depends only on
+        # omega / T, so letting omega carry a free scale would make the
+        # temperature meaningless.  Normalising on read and storing the result
+        # keeps `state.info` honest about what was used.
+        weights = normalize_omega(state.info["reward_weights"])
+        reward = jnp.dot(weights, reward_components)
 
         done = jnp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
         done |= pos[2] < 0.15
         done = done.astype(jnp.float32)
 
         state.info["step"] += 1
+        state.info["reward_weights"] = weights
         state.info["reward_terms"] = reward_components
         state.info["feet_lifted"] = n_lifted
 

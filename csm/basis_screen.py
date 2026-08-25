@@ -48,6 +48,7 @@ from dial_mpc.core.dial_core import make_controller
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 
 from csm.dial_lean import make_dial_step, make_rollout, make_sampler
+from csm.omega import normalize_omega_np
 
 
 def _load_config(example: str | None, config_path: str | None):
@@ -64,22 +65,29 @@ def _load_config(example: str | None, config_path: str | None):
 
 
 def build_omegas(n_rows: int) -> Dict[str, np.ndarray]:
-    """Vertices plus the basis rows we would actually train on."""
+    """Vertices plus the basis rows we would actually train on, unit length.
 
-    omegas: Dict[str, np.ndarray] = {}
+    Every weight vector is normalised on the way out.  The objective depends on
+    omega / T alone, so a free scale on omega would make the temperature
+    meaningless; fixing the length here is what lets a temperature be measured,
+    quoted and composed.
+    """
+
+    raw: Dict[str, np.ndarray] = {}
     for i in range(n_rows):
         vec = np.zeros(n_rows)
         vec[i] = 1.0
-        omegas[f"e{i}"] = vec
-    omegas["uniform"] = np.ones(n_rows)
+        raw[f"e{i}"] = vec
+    raw["uniform"] = np.ones(n_rows)
     for i in range(n_rows):
         vec = np.ones(n_rows)
         vec[i] = 3.0
-        omegas[f"boost{i}"] = vec
-    return omegas
+        raw[f"boost{i}"] = vec
+    return {name: normalize_omega_np(vec) for name, vec in raw.items()}
 
 
-def make_pipeline(env, mbdpi, dial_config, warmup_steps: int):
+def make_pipeline(env, mbdpi, dial_config, warmup_steps: int,
+                  std_normalize: bool = True):
     """Warm DIAL up on the shared control weights, then emit one sample cloud.
 
     Scoring every omega on a cloud drawn around a *warmed-up* plan at the final
@@ -95,7 +103,8 @@ def make_pipeline(env, mbdpi, dial_config, warmup_steps: int):
     comparison honest.
     """
 
-    control_step = make_dial_step(env, mbdpi, dial_config)
+    control_step = make_dial_step(env, mbdpi, dial_config,
+                                  std_normalize=std_normalize)
     sample = make_sampler(mbdpi, dial_config)
     final_noise = mbdpi.sigma_control * (
         dial_config.traj_diffuse_factor ** (dial_config.Ndiffuse - 1)
@@ -134,19 +143,23 @@ def make_pipeline(env, mbdpi, dial_config, warmup_steps: int):
     return pipeline, float(jnp.mean(final_noise))
 
 
-def mppi_weights(returns: jnp.ndarray, temp: float) -> jnp.ndarray:
+def mppi_weights(returns: jnp.ndarray, temp: float,
+                 std_normalize: bool = True) -> jnp.ndarray:
     """DIAL's softmax update weights for one omega's sample returns."""
 
     reference = returns[-1]
-    scale = jnp.maximum(returns.std(), 1e-6)
+    scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
     return jax.nn.softmax((returns - reference) / scale / temp)
 
 
-def analyse_state(terms, Y0s, lifted, done, omega_mat, temp, elite_frac):
+def analyse_state(terms, Y0s, lifted, done, omega_mat, temp, elite_frac,
+                  std_normalize=True):
     """All omegas, one shared sample cloud."""
 
     returns = terms @ omega_mat.T  # (n_sample, n_omega)
-    weights = jax.vmap(mppi_weights, in_axes=(1, None), out_axes=0)(returns, temp)
+    weights = jax.vmap(
+        lambda r: mppi_weights(r, temp, std_normalize), in_axes=1, out_axes=0
+    )(returns)
     # MPPI's actual output: the weighted mean node trajectory.
     updates = jnp.einsum("kn,nij->kij", weights, Y0s)
     ess = 1.0 / jnp.sum(weights**2, axis=1)
@@ -205,6 +218,10 @@ def main() -> None:
              "is already Nsample wide, so this multiplies device occupancy",
     )
     parser.add_argument("--elite-frac", type=float, default=0.05)
+    parser.add_argument("--std-normalize", dest="std", action="store_true")
+    parser.add_argument("--no-std-normalize", dest="std", action="store_false",
+                        help="drive DIAL with the raw Gibbs exponent")
+    parser.set_defaults(std=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default=None)
     args = parser.parse_args()
@@ -221,7 +238,7 @@ def main() -> None:
 
     reset_vmap = jax.jit(jax.vmap(env.reset))
     pipeline, noise_level = make_pipeline(
-        env, mbdpi, dial_config, args.warmup_steps
+        env, mbdpi, dial_config, args.warmup_steps, args.std
     )
 
     rng = jax.random.PRNGKey(args.seed)
@@ -237,7 +254,7 @@ def main() -> None:
         terms, nodes, lifted, done, push = pipeline(state, key)
         out = analyse_state(
             terms, nodes, lifted, done, omega_mat,
-            dial_config.temp_sample, args.elite_frac,
+            dial_config.temp_sample, args.elite_frac, args.std,
         )
         out["push_speed"] = push
         out["cloud_fail"] = done.mean()
