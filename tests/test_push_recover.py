@@ -130,17 +130,41 @@ class PushRecoverBasisTest(unittest.TestCase):
             f"contact row is insensitive to translation ({contact_change})",
         )
 
-    def test_reward_is_the_weighted_row_sum(self):
+    def test_reward_uses_the_unit_normalised_weights(self):
+        """Whatever scale comes in, the reward is computed at unit length.
+
+        The objective depends only on `omega / T`, so a free scale on omega
+        would leave the temperature undefined.  Normalising here means no
+        caller -- planner, viewer, sweep -- can reintroduce that ambiguity, and
+        the stored weights always say what was actually used.
+        """
+
         env = self.env
         weights = jnp.array([0.3, 1.7, 0.5, 2.1])
+        unit = weights / jnp.linalg.norm(weights)
         state = self.fns["reset"](jax.random.PRNGKey(1))
         state.info["reward_weights"] = weights
         stepped = self.fns["step"](state, jnp.zeros(env.action_size))
         self.assertAlmostEqual(
             float(stepped.reward),
-            float(jnp.dot(weights, stepped.info["reward_terms"])),
+            float(jnp.dot(unit, stepped.info["reward_terms"])),
             places=5,
         )
+        np.testing.assert_allclose(
+            np.asarray(stepped.info["reward_weights"]), np.asarray(unit), atol=1e-6
+        )
+
+    def test_reward_is_invariant_to_the_incoming_weight_scale(self):
+        env = self.env
+        rewards = []
+        for scale in (0.5, 1.0, 7.0):
+            state = self.fns["reset"](jax.random.PRNGKey(1))
+            state.info["reward_weights"] = jnp.array([1.0, 2.0, 0.5, 1.5]) * scale
+            rewards.append(
+                float(self.fns["step"](state, jnp.zeros(env.action_size)).reward)
+            )
+        self.assertAlmostEqual(rewards[0], rewards[1], places=5)
+        self.assertAlmostEqual(rewards[1], rewards[2], places=5)
 
     def test_push_is_applied_at_reset(self):
         speeds = [
@@ -185,3 +209,66 @@ class LeanSamplerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OmegaConventionTest(unittest.TestCase):
+    """Unit weights and the nu solve that per-field temperatures require."""
+
+    def test_normalization_keeps_direction_and_survives_zero(self):
+        from csm.omega import normalize_omega
+
+        raw = jnp.array([3.0, 1.0, 1.0, 1.0])
+        unit = normalize_omega(raw)
+        self.assertAlmostEqual(float(jnp.linalg.norm(unit)), 1.0, places=6)
+        self.assertAlmostEqual(
+            float(jnp.dot(unit, raw) / jnp.linalg.norm(raw)), 1.0, places=6
+        )
+        np.testing.assert_allclose(
+            np.asarray(normalize_omega(jnp.zeros(4))), np.zeros(4)
+        )
+
+    def test_nu_solve_reduces_and_retempers(self):
+        from csm.omega import normalize_omega_np, nu_coefficients
+
+        basis = np.stack([
+            normalize_omega_np(np.eye(4)[i] * 2.0 + 1.0) for i in range(4)
+        ])
+        temps = np.array([0.25, 0.30, 0.37, 0.39])
+
+        for j in range(4):
+            a = nu_coefficients(basis, temps, basis[j], temps[j])
+            np.testing.assert_allclose(a, np.eye(4)[j], atol=1e-9)
+
+        # Same field, sharper: one coefficient, scaled by the temperature ratio.
+        a = nu_coefficients(basis, temps, basis[2], 0.25)
+        expected = np.eye(4)[2] * (temps[2] / 0.25)
+        np.testing.assert_allclose(a, expected, atol=1e-9)
+
+    def test_omega_solve_is_wrong_when_temperatures_differ(self):
+        """The failure mode nu space exists to fix.
+
+        With mixed temperatures the legacy solve reproduces neither the
+        requested sharpness nor, because each field is scaled differently, the
+        requested direction.
+        """
+
+        from csm.omega import (
+            normalize_omega_np, nu_coefficients, nu_matrix, omega_coefficients,
+        )
+
+        basis = np.stack([
+            normalize_omega_np(np.eye(4)[i] * 2.0 + 1.0) for i in range(4)
+        ])
+        temps = np.array([0.25, 0.30, 0.37, 0.39])
+        target, target_temp = normalize_omega_np(np.ones(4)), 0.30
+
+        matrix = nu_matrix(basis, temps)
+        wanted = target / target_temp
+        np.testing.assert_allclose(
+            nu_coefficients(basis, temps, target, target_temp) @ matrix,
+            wanted, atol=1e-9,
+        )
+        got = omega_coefficients(basis, target) @ matrix
+        self.assertGreater(np.abs(got - wanted).max() / np.abs(wanted).max(), 0.1)
+        # Not merely mis-scaled: the realised direction is uneven too.
+        self.assertGreater(got.max() / got.min() - 1.0, 0.05)

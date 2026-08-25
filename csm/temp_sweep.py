@@ -42,15 +42,17 @@ from csm.dial_lean import make_rollout, make_sampler
 from csm.push_recover_eval import make_push_reset
 
 
-def effective_sample_size(returns: jnp.ndarray, temp: jnp.ndarray) -> jnp.ndarray:
+def effective_sample_size(
+    returns: jnp.ndarray, temp: jnp.ndarray, std_normalize: bool = True
+) -> jnp.ndarray:
     """DIAL's own weighting, then 1 / sum(w^2)."""
 
-    scale = jnp.maximum(returns.std(), 1e-6)
+    scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
     weights = jax.nn.softmax((returns - returns[-1]) / scale / temp)
     return 1.0 / jnp.sum(weights**2)
 
 
-def make_probe_step(env, mbdpi, dial_config, eval_temps):
+def make_probe_step(env, mbdpi, dial_config, eval_temps, std_normalize=True):
     sample = make_sampler(mbdpi, dial_config)
     rollout_vmap = jax.vmap(make_rollout(env), in_axes=(None, 0))
     sigma = mbdpi.sigma_control
@@ -60,7 +62,7 @@ def make_probe_step(env, mbdpi, dial_config, eval_temps):
         rng, key = jax.random.split(rng)
         nodes = sample(key, plan, noise_scale)
         returns = rollout_vmap(state, mbdpi.node2u_vvmap(nodes)).mean(axis=-1)
-        scale = jnp.maximum(returns.std(), 1e-6)
+        scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
         weights = jax.nn.softmax((returns - returns[-1]) / scale / temp)
         return rng, jnp.einsum("n,nij->ij", weights, nodes), returns
 
@@ -75,14 +77,16 @@ def make_probe_step(env, mbdpi, dial_config, eval_temps):
         (rng, plan), returns = jax.lax.scan(body, (rng, plan), factors)
         state = env.step(state, plan[0])
         final = returns[-1]
-        ess = jax.vmap(effective_sample_size, in_axes=(None, 0))(final, eval_temps)
+        ess = jax.vmap(
+            lambda t: effective_sample_size(final, t, std_normalize)
+        )(eval_temps)
         return state, rng, plan, ess, final.std()
 
     return step
 
 
-def make_episode(env, mbdpi, dial_config, eval_temps, n_steps: int):
-    probe = make_probe_step(env, mbdpi, dial_config, eval_temps)
+def make_episode(env, mbdpi, dial_config, eval_temps, n_steps: int, std_normalize=True):
+    probe = make_probe_step(env, mbdpi, dial_config, eval_temps, std_normalize)
 
     def episode(state, rng, temp):
         plan = jnp.zeros((dial_config.Hnode + 1, mbdpi.nu))
@@ -124,6 +128,11 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--chunk", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--std-normalize", dest="std", action="store_true")
+    parser.add_argument("--no-std-normalize", dest="std", action="store_false",
+                        help="score the raw Gibbs exponent nu . (-C) instead of "
+                             "DIAL's spread-normalised one")
+    parser.set_defaults(std=True)
     parser.add_argument("--out", type=str, default=None)
     args = parser.parse_args()
 
@@ -150,7 +159,7 @@ def main() -> None:
     roll_keys = jax.random.split(roll_rng, n_seed)
 
     push_reset = make_push_reset(env)
-    episode = make_episode(env, mbdpi, dial_config, eval_temps, args.steps)
+    episode = make_episode(env, mbdpi, dial_config, eval_temps, args.steps, args.std)
 
     grid = jnp.meshgrid(
         jnp.arange(n_omega), jnp.arange(n_temp),
@@ -174,7 +183,8 @@ def main() -> None:
         return jax.tree.map(lambda x: x.reshape((-1,) + x.shape[2:])[:total], out)
 
     print(f"[temp] {n_omega} omegas x {n_temp} temps x {n_push} pushes x {n_seed} "
-          f"seeds = {total} episodes, {args.steps} steps, Nsample={n_sample}")
+          f"seeds = {total} episodes, {args.steps} steps, Nsample={n_sample}, "
+          f"std_normalize={args.std}")
     t0 = time.time()
     result = run()
     jax.block_until_ready(result)

@@ -68,8 +68,9 @@ def make_push_reset(env):
     return reset
 
 
-def make_episode(env, mbdpi, dial_config, n_steps: int):
-    control_step = make_dial_step(env, mbdpi, dial_config)
+def make_episode(env, mbdpi, dial_config, n_steps: int, std_normalize=True):
+    control_step = make_dial_step(env, mbdpi, dial_config,
+                                  std_normalize=std_normalize)
     nominal_feet = env._nominal_foot_pos
     nominal_xy = env._nominal_base_xy
     torso = env._torso_idx - 1
@@ -142,6 +143,10 @@ def main() -> None:
     )
     parser.add_argument("--step-threshold", type=float, default=0.05)
     parser.add_argument("--chunk", type=int, default=16)
+    parser.add_argument("--std-normalize", dest="std", action="store_true")
+    parser.add_argument("--no-std-normalize", dest="std", action="store_false",
+                        help="drive DIAL with the raw Gibbs exponent")
+    parser.set_defaults(std=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default=None)
     args = parser.parse_args()
@@ -178,7 +183,7 @@ def main() -> None:
     total = flat_o.size
 
     push_reset = make_push_reset(env)
-    episode = make_episode(env, mbdpi, dial_config, args.steps)
+    episode = make_episode(env, mbdpi, dial_config, args.steps, args.std)
 
     def one(io, is_, id_):
         state = push_reset(
