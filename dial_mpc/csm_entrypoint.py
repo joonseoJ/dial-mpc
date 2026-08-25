@@ -30,3 +30,45 @@ def evaluate() -> None:
     from csm.eval import main
 
     main()
+
+
+def train_rl_prior() -> None:
+    from csm.rl_prior_cli import main
+
+    main()
+
+
+def residual_mppi() -> None:
+    from csm.residual_mppi import main
+
+    main()
+
+
+def dial_score() -> None:
+    from csm.dial_score_cli import main
+
+    main()
+
+
+def dial_score_eval() -> None:
+    from csm.dial_score_eval import main
+
+    main()
+
+
+def dial_score_serve() -> None:
+    from csm.dial_score_serve import main
+
+    main()
+
+
+def dial_score_compose() -> None:
+    from csm.dial_score_compose_cli import main
+
+    main()
+
+
+def dial_score_bank() -> None:
+    from csm.dial_score_bank import main
+
+    main()

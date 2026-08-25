@@ -43,6 +43,13 @@ setup(
             "dial-csm=dial_mpc.csm_entrypoint:train",
             "dial-csm-benchmark=dial_mpc.csm_entrypoint:benchmark",
             "dial-csm-eval=dial_mpc.csm_entrypoint:evaluate",
+            "dial-rl-prior=dial_mpc.csm_entrypoint:train_rl_prior",
+            "dial-residual-mppi=dial_mpc.csm_entrypoint:residual_mppi",
+            "dial-score=dial_mpc.csm_entrypoint:dial_score",
+            "dial-score-eval=dial_mpc.csm_entrypoint:dial_score_eval",
+            "dial-score-serve=dial_mpc.csm_entrypoint:dial_score_serve",
+            "dial-score-compose=dial_mpc.csm_entrypoint:dial_score_compose",
+            "dial-score-bank=dial_mpc.csm_entrypoint:dial_score_bank",
         ],
     },
 )
