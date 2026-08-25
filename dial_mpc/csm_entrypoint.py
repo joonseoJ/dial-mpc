@@ -62,6 +62,12 @@ def dial_score_serve() -> None:
     main()
 
 
+def dial_live() -> None:
+    from csm.dial_live import main
+
+    main()
+
+
 def dial_score_compose() -> None:
     from csm.dial_score_compose_cli import main
 
