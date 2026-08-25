@@ -8,6 +8,7 @@ from dial_mpc.envs.unitree_go2_env import (
     UnitreeGo2EnvConfig,
     UnitreeGo2SeqJumpEnvConfig,
     UnitreeGo2CrateEnvConfig,
+    UnitreeGo2PushRecoverEnvConfig,
 )
 from dial_mpc.envs.manipulation import AllegroReorientEnvConfig
 
@@ -18,6 +19,7 @@ _configs = {
     "unitree_go2_walk": UnitreeGo2EnvConfig,
     "unitree_go2_seq_jump": UnitreeGo2SeqJumpEnvConfig,
     "unitree_go2_crate_climb": UnitreeGo2CrateEnvConfig,
+    "unitree_go2_push_recover": UnitreeGo2PushRecoverEnvConfig,
     "allegro_reorient": AllegroReorientEnvConfig,
 }
 

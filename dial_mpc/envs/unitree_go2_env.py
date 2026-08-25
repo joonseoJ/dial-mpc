@@ -916,6 +916,174 @@ class UnitreeGo2CrateEnv(UnitreeGo2Env):
         return state
 
 
+@dataclass
+class UnitreeGo2PushRecoverEnvConfig(UnitreeGo2EnvConfig):
+    """Stand-and-resist task used to screen a disturbance-rejection basis.
+
+    The robot holds a nominal stance and is hit with a velocity impulse on the
+    floating base.  Nothing is hidden from the planner: the push lands at reset,
+    so DIAL simply sees a disturbed state and has to react to it.
+    """
+
+    enable_body_collisions: bool = True
+    terminate_on_joint_limit: bool = False
+    gait: str = "stand"
+    default_vx: float = 0.0
+    default_vy: float = 0.0
+    default_vyaw: float = 0.0
+    ramp_up_time: float = 0.0
+    nominal_height: float = 0.30
+    # Reset impulse magnitude (m/s on the base).  Sampled in
+    # [push_scale_min, 1] * push_linear_velocity so that one screening run
+    # covers a band of disturbance sizes rather than a single operating point.
+    push_linear_velocity: float = 1.0
+    push_angular_velocity: float = 0.0
+    push_scale_min: float = 0.25
+    # Row normalizers.  Each row reads about -1 at a "moderate" deviation:
+    # 0.2 rad of tilt, 0.10 m of base offset, 0.10 m of slip per foot, and
+    # 0.3 rad on every joint.  Comparable row scales are what make a weight
+    # grid meaningful -- otherwise one row dominates at every omega.
+    tilt_scale: float = 0.04
+    base_scale: float = 0.01
+    foot_scale: float = 0.04
+    shape_scale: float = 1.0
+    foot_lift_penalty: float = 0.5
+    reward_weights: jax.Array = field(
+        default_factory=lambda: jnp.array([1.0, 1.0, 1.0, 1.0])
+    )
+
+
+class UnitreeGo2PushRecoverEnv(UnitreeGo2Env):
+    """Four-row disturbance-rejection basis.
+
+    The rows deliberately live at three different levels of the kinematic
+    chain, because rows drawn from a single level are collinear and cannot
+    move the argmax:
+
+      0. torso tilt          -- orientation only, position excluded
+      1. base pose           -- hold the CoM over its start point
+      2. contact             -- keep each foot where it started, in world frame
+      3. shape               -- keep the joints at the nominal stance
+
+    Rows 2 and 3 are separated only by the floating base: world-frame foot
+    position and base-relative joint angle are the same quantity once the base
+    is pinned.  Keeping row 2 in world coordinates is what makes "plant the
+    feet and bend" and "hold the shape and step" distinct solutions.
+    """
+
+    def __init__(self, config: UnitreeGo2PushRecoverEnvConfig):
+        super().__init__(config)
+        # Nominal contact geometry, evaluated once from the home keyframe.  The
+        # reset pose is fixed, so these world-frame targets are constants.
+        init_state = self.pipeline_init(self._init_q, jnp.zeros(self._nv))
+        self._nominal_foot_pos = jnp.asarray(
+            init_state.site_xpos[self._feet_site_id]
+        )
+        self._nominal_base_xy = jnp.asarray(
+            init_state.x.pos[self._torso_idx - 1][:2]
+        )
+
+    def _sample_push(self, rng: jax.Array) -> tuple[jax.Array, jax.Array]:
+        heading_key, scale_key, ang_key = jax.random.split(rng, 3)
+        heading = jax.random.uniform(heading_key, (), minval=-jnp.pi, maxval=jnp.pi)
+        scale = jax.random.uniform(
+            scale_key, (), minval=self._config.push_scale_min, maxval=1.0
+        )
+        speed = self._config.push_linear_velocity * scale
+        linear = jnp.stack(
+            [speed * jnp.cos(heading), speed * jnp.sin(heading), jnp.asarray(0.0)]
+        )
+        angular = jax.random.uniform(
+            ang_key, (3,), minval=-1.0, maxval=1.0
+        ) * self._config.push_angular_velocity
+        return linear, angular
+
+    def reset(self, rng: jax.Array) -> State:  # pytype: disable=signature-mismatch
+        state = super().reset(rng)
+        rng, push_rng = jax.random.split(state.info["rng"])
+        linear, angular = self._sample_push(push_rng)
+
+        qpos = state.pipeline_state.qpos
+        qvel = state.pipeline_state.qvel.at[:3].add(linear).at[3:6].add(angular)
+        pipeline_state = self.pipeline_init(qpos, qvel)
+
+        state.info["rng"] = rng
+        state.info["pos_tar"] = jnp.array(
+            [self._nominal_base_xy[0], self._nominal_base_xy[1],
+             self._config.nominal_height]
+        )
+        state.info["vel_tar"] = jnp.zeros(3)
+        state.info["ang_vel_tar"] = jnp.zeros(3)
+        state.info["push_linear"] = linear
+        state.info["push_speed"] = jnp.linalg.norm(linear)
+        state.info["reward_terms"] = jnp.zeros(4)
+        state.info["feet_lifted"] = jnp.zeros(())
+
+        obs = self._get_obs(pipeline_state, state.info)
+        return state.replace(pipeline_state=pipeline_state, obs=obs)
+
+    def step(self, state: State, action: jax.Array) -> State:
+        if self._config.leg_control == "position":
+            ctrl = self.act2joint(action)
+            pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
+        else:
+            pipeline_state = self.pd_pipeline_step(state.pipeline_state, action)
+        x = pipeline_state.x
+        obs = self._get_obs(pipeline_state, state.info)
+
+        pos = x.pos[self._torso_idx - 1]
+        up = jnp.array([0.0, 0.0, 1.0])
+        vec = math.rotate(up, x.rot[self._torso_idx - 1])
+
+        # Row 0 -- torso tilt.  Orientation only.  Splitting this from the base
+        # position row is the whole point: holding the CoM against a push needs
+        # a horizontal ground reaction force, and that force tilts the torso.
+        reward_tilt = -jnp.sum(jnp.square(vec - up)) / self._config.tilt_scale
+
+        # Row 1 -- base pose: keep the CoM over where it started.
+        base_err = jnp.sum(
+            jnp.square(pos[:2] - self._nominal_base_xy)
+        ) + jnp.square(pos[2] - self._config.nominal_height)
+        reward_base = -base_err / self._config.base_scale
+
+        # Row 2 -- contact: keep each foot on its original world-frame spot,
+        # plus an explicit price on breaking contact at all.
+        foot_pos = pipeline_state.site_xpos[self._feet_site_id]
+        foot_err = jnp.sum(jnp.square(foot_pos - self._nominal_foot_pos))
+        lifted = (foot_pos[:, 2] - self._foot_radius) > 1e-3
+        n_lifted = jnp.sum(lifted.astype(jnp.float32))
+        reward_feet = -(
+            foot_err / self._config.foot_scale
+            + self._config.foot_lift_penalty * n_lifted
+        )
+
+        # Row 3 -- shape: base-relative joint configuration.
+        joint_angles = pipeline_state.q[7:]
+        reward_shape = -jnp.sum(
+            jnp.square(joint_angles - self._default_pose)
+        ) / self._config.shape_scale
+
+        reward_components = jnp.stack(
+            [reward_tilt, reward_base, reward_feet, reward_shape]
+        )
+        reward = jnp.dot(state.info["reward_weights"], reward_components)
+
+        done = jnp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
+        done |= pos[2] < 0.15
+        done = done.astype(jnp.float32)
+
+        state.info["step"] += 1
+        state.info["reward_terms"] = reward_components
+        state.info["feet_lifted"] = n_lifted
+
+        return state.replace(
+            pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
+        )
+
+
 brax_envs.register_environment("unitree_go2_walk", UnitreeGo2Env)
 brax_envs.register_environment("unitree_go2_seq_jump", UnitreeGo2SeqJumpEnv)
 brax_envs.register_environment("unitree_go2_crate_climb", UnitreeGo2CrateEnv)
+brax_envs.register_environment(
+    "unitree_go2_push_recover", UnitreeGo2PushRecoverEnv
+)
