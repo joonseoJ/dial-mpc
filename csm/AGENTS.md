@@ -149,6 +149,35 @@ network can reproduce DIAL before composition is reintroduced.
   degraded composition (`(1,2,1)` went 1.79x -> 1.99x while its field's own
   validation improved 30%).  Collect for composition with the *composed* policy
   driving, over the omega range it will be deployed at.
+- Basis weight vectors must be linearly independent and no more numerous than
+  the reward rows, or `coefficients` cannot reduce.  With `B` the k-by-n matrix
+  of basis weights, `pinv` returns `e_j` for a target equal to row `j` only when
+  `B` has full row rank; short of that it returns the minimum-norm spread and
+  the composed field mixes in networks that should have had coefficient zero.
+  The earlier 2.00 reduction error was exactly this: four basis weights in a
+  three-row reward space.  The Go2 push-recovery basis
+  `{(3,1,1,1), (1,3,1,1), (1,1,3,1), (1,1,1,3)}` has rank 4 and condition
+  number 3.0, and reduces to 1e-16.
+- Temperature is not a free parameter alongside omega -- the exact Gibbs score
+  depends only on `omega / T`, so per-weight temperatures are legitimate and the
+  composition solve simply moves to `nu = omega / T` space.  Rank, and therefore
+  reduction, is unaffected by rescaling each basis vector.
+- Pick that temperature by measured concentration, not by inheriting DIAL's
+  0.05.  At 0.05 the update is a hard argmax -- effective sample size 1.1 out of
+  2049 -- so a score label is one lucky sample, not an average.  Because DIAL
+  divides returns by their own standard deviation, the temperature that yields a
+  given concentration depends on the weight vector: on the push-recovery basis a
+  single 0.30 spans 2.9% to 16.2% ESS across the four fields (5.6x).
+  Equalising at ~10% needs (0.25, 0.30, 0.37, 0.39) for boost0-3, which lands
+  every field within 1.05x.  Push magnitude barely moves ESS (4.4% to 4.9%
+  across 0.2-0.9 m/s), so one temperature per weight covers the whole
+  disturbance range.
+- Raising the temperature buys label quality and spends behavioural contrast.
+  Between the same four basis weights, the mean MPPI update distance fell 0.364
+  to 0.103 sigma going from 0.05 to 0.30, and the omega-spread of torso tilt
+  fell to 0.25x.  Elite-set overlap and the diagonal check are unchanged, since
+  those rank samples rather than weight them.  Screen discriminativeness at the
+  temperature you will actually collect at.
 - Choose basis rows that all keep DIAL walking; a weight the planner cannot
   locomote under yields a field fitted to garbage states.  Judge conditioning on
   the simplex (direction only), since scale is ignored.
