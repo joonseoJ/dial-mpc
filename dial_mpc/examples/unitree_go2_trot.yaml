@@ -16,11 +16,20 @@ update_method: mppi
 
 # Base environment
 dt: 0.02
-timestep: 0.02
+# Two physics substeps per control step.  At a single 20 ms step MuJoCo's soft
+# joint-limit constraint does not converge and `done` fires on a sub-degree
+# limit violation during normal walking; 0.01 removes that entirely.
+timestep: 0.01
 leg_control: torque
+# Close the joint PD loop every physics substep rather than holding the torque
+# computed at the start of the control step, as a real motor driver does.
+pd_substep: true
 action_scale: 1.0
 
 # Go2
+# A joint touching its limit is solver slack, not a fall; terminate only on the
+# conditions that mean the robot is down.
+terminate_on_joint_limit: false
 default_vx: 0.8
 default_vy: 0.0
 default_vyaw: 0.0

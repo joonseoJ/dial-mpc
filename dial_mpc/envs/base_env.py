@@ -49,6 +49,24 @@ class BaseEnv(PipelineEnv):
         )
         return joint_targets
 
+    def pd_pipeline_step(self, pipeline_state, act: jax.Array):
+        """Advance the physics, optionally closing the PD loop per substep.
+
+        ``PipelineEnv.pipeline_step`` holds one ctrl vector across all
+        ``n_frames`` substeps, so with torque control the PD feedback is as old
+        as the control step.  With ``pd_substep`` the torque is recomputed from
+        the running state, which is what a motor driver does.
+        """
+        if not getattr(self._config, "pd_substep", False):
+            return self.pipeline_step(pipeline_state, self.act2tau(act, pipeline_state))
+
+        def substep(state, _):
+            return self._pipeline.step(
+                self.sys, state, self.act2tau(act, state), self._debug
+            ), None
+
+        return jax.lax.scan(substep, pipeline_state, (), self._n_frames)[0]
+
     @partial(jax.jit, static_argnums=(0,))
     def act2tau(self, act: jax.Array, pipline_state) -> jax.Array:
         joint_target = self.act2joint(act)

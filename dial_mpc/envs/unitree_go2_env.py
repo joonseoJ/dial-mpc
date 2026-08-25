@@ -32,6 +32,7 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     ramp_up_time: float = 2.0
     gait: str = "trot"
     include_foot_height_observation: bool = False
+    enable_body_collisions: bool = False
     command_vx_min: float = -1.5
     command_vx_max: float = 1.5
     command_vy_min: float = -0.5
@@ -112,7 +113,12 @@ class UnitreeGo2Env(BaseEnv):
         self._feet_site_id = jnp.array(feet_site_id)
 
     def make_system(self, config: UnitreeGo2EnvConfig) -> System:
-        model_path = get_model_path("unitree_go2", "mjx_scene_force.xml")
+        scene = (
+            "mjx_scene_force_collision.xml"
+            if config.enable_body_collisions
+            else "mjx_scene_force.xml"
+        )
+        model_path = get_model_path("unitree_go2", scene)
         sys = mjcf.load(model_path)
         sys = sys.tree_replace({"opt.timestep": config.timestep})
         return sys
@@ -164,10 +170,9 @@ class UnitreeGo2Env(BaseEnv):
         # physics step
         joint_targets = self.act2joint(action)
         if self._config.leg_control == "position":
-            ctrl = joint_targets
+            pipeline_state = self.pipeline_step(state.pipeline_state, joint_targets)
         elif self._config.leg_control == "torque":
-            ctrl = self.act2tau(action, state.pipeline_state)
-        pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
+            pipeline_state = self.pd_pipeline_step(state.pipeline_state, action)
         x, xd = pipeline_state.x, pipeline_state.xd
 
         # observation data
@@ -267,8 +272,9 @@ class UnitreeGo2Env(BaseEnv):
         up = jnp.array([0.0, 0.0, 1.0])
         joint_angles = pipeline_state.q[7:]
         done = jnp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
-        done |= jnp.any(joint_angles < self.joint_range[:, 0])
-        done |= jnp.any(joint_angles > self.joint_range[:, 1])
+        if self._config.terminate_on_joint_limit:
+            done |= jnp.any(joint_angles < self.joint_range[:, 0])
+            done |= jnp.any(joint_angles > self.joint_range[:, 1])
         done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.18
         done = done.astype(jnp.float32)
 
@@ -510,11 +516,14 @@ class UnitreeGo2SeqJumpEnv(UnitreeGo2Env):
         # physics step
         if self._config.leg_control == "position":
             ctrl = self.act2joint(action)
+            pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
         elif self._config.leg_control == "torque":
+            # The reward terms below read `ctrl`; keep the start-of-step torque
+            # for them while the physics closes the PD loop per substep.
             ctrl = self.act2tau(action, state.pipeline_state)
+            pipeline_state = self.pd_pipeline_step(state.pipeline_state, action)
         else:
             raise ValueError("Invalid leg control type.")
-        pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
         x, xd = pipeline_state.x, pipeline_state.xd
 
         # observation data
@@ -601,8 +610,9 @@ class UnitreeGo2SeqJumpEnv(UnitreeGo2Env):
         up = jnp.array([0.0, 0.0, 1.0])
         joint_angles = pipeline_state.q[7:]
         done = jnp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
-        done |= jnp.any(joint_angles < self.joint_range[:, 0])
-        done |= jnp.any(joint_angles > self.joint_range[:, 1])
+        if self._config.terminate_on_joint_limit:
+            done |= jnp.any(joint_angles < self.joint_range[:, 0])
+            done |= jnp.any(joint_angles > self.joint_range[:, 1])
         done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.1
         done = done.astype(jnp.float32)
 
@@ -786,9 +796,10 @@ class UnitreeGo2CrateEnv(UnitreeGo2Env):
         # physics step
         if self._config.leg_control == "position":
             ctrl = self.act2joint(action)
+            pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
         elif self._config.leg_control == "torque":
             ctrl = self.act2tau(action, state.pipeline_state)
-        pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
+            pipeline_state = self.pd_pipeline_step(state.pipeline_state, action)
         x, xd = pipeline_state.x, pipeline_state.xd
 
         # observation data
