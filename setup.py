@@ -49,6 +49,7 @@ setup(
             "dial-score-eval=dial_mpc.csm_entrypoint:dial_score_eval",
             "dial-score-serve=dial_mpc.csm_entrypoint:dial_score_serve",
             "dial-live=dial_mpc.csm_entrypoint:dial_live",
+            "csm-live=dial_mpc.csm_entrypoint:csm_live",
             "dial-score-compose=dial_mpc.csm_entrypoint:dial_score_compose",
             "dial-score-bank=dial_mpc.csm_entrypoint:dial_score_bank",
         ],

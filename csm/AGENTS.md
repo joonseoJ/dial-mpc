@@ -108,9 +108,37 @@ network can reproduce DIAL before composition is reintroduced.
   update is **invariant to the scale of omega**: `delta(omega) == delta(a*omega)`
   to six digits.  Least squares alone therefore mis-scales any target whose
   coefficients do not sum to one — `(1,1,1)` composed with cosine 0.9997 but 40%
-  relative error.  `ComposedDialScorePolicy.coefficients` rescales the
-  coefficients to sum to one, which fixes the magnitude (40% -> 2.4%) and cannot
-  change the direction.  Never drop that normalisation.
+  relative error, which the sum-to-one rescale in
+  `ComposedDialScorePolicy.coefficients` patched to 2.4%.  That rescale is a
+  workaround for information the division destroyed, and it is only correct
+  under it; the nu solve below recovers the magnitude properly and the fallback
+  is kept only for policies saved before temperatures were recorded.
+- Drop the standard-deviation division and the approximation largely goes away.
+  Measured on the push-recovery basis, mean relative error over interior
+  targets: 0.218 with the division (nu and omega solves indistinguishable),
+  0.150 without it in omega space, 0.114 without it in nu space, 0.105 adding
+  per-weight temperatures.  Cosine 0.981 -> 0.995.  Reduction is exact (1e-16)
+  in every variant.  Two separate effects: removing the division buys the
+  linearity, solving in nu recovers the magnitude.
+- Normalise every incoming omega to unit length, at the point the reward is
+  formed, so no caller can reintroduce a scale.  The objective depends only on
+  `omega / T`; leaving omega a free scale is what made a fixed temperature
+  unusable and forced the division in the first place.  With unit omega the
+  convention is clean: omega is direction, `1/T` is sharpness.
+- Without the division a fixed temperature means wildly different sharpness at
+  different annealing levels, because a coarse level perturbs the plan far
+  enough to knock the robot over and the returns spread accordingly.  Measured
+  at T=0.25: fine-level base query 43% effective sample size, coarse-level 0.5%
+  — a factor of 84.  Scale the temperature per level (profile `(3.175, 1.0)`
+  here, measured by equalising ESS on base queries) and the gap closes to 1.0x.
+  The profile cancels out of the composition coefficients, since it multiplies
+  every field and the target alike, so the deployed solve is unchanged.
+  Verified closed-loop: no falls at pushes up to 2.0 m/s under either schedule,
+  behaviour within noise, and the omega-spread of P(step) doubles.
+- Do not try to pick a temperature analytically from the return spread.  The
+  Gaussian relation `ESS/N = exp(-(s/T)^2)` predicts ~0% where 5-25% is
+  measured, because returns are heavily left-skewed: most samples fall and the
+  standard deviation is set by a tail the softmax never looks at.  Measure it.
 - Each basis weight gets its own complete `DialScoreMLP`, never a head on a
   shared trunk, so every field stays independently testable with
   `dial-score-eval` and `dial-score-serve` and a shared encoder is never a
@@ -161,7 +189,27 @@ network can reproduce DIAL before composition is reintroduced.
 - Temperature is not a free parameter alongside omega -- the exact Gibbs score
   depends only on `omega / T`, so per-weight temperatures are legitimate and the
   composition solve simply moves to `nu = omega / T` space.  Rank, and therefore
-  reduction, is unaffected by rescaling each basis vector.
+  reduction, is unaffected by rescaling each basis vector.  The deployed solve is
+  `a = (T / T*) * omega* @ pinv(B)` for unit `omega*`; a target temperature
+  different from the training one just scales the coefficients, so retempering a
+  field is free (exact in score space, ~11% relative error on the bounded
+  update).
+- Store the sample cloud, not the label.  Per-sample per-row costs plus one rng
+  key per cloud reconstruct any label, so the weight, the temperature, the level
+  profile and the repeat count are all decided after collection by a softmax
+  with no physics.  The sampled trajectories are a deterministic function of the
+  key and cost 8 bytes instead of ~700 KB.  The one thing this does *not* make
+  reusable is the ladder of perturbation distances, which determines which query
+  plans were physically rolled out.
+- Perturbation distance is a coverage-versus-label-quality trade, and a ladder
+  beats a single value.  At `perturb_scale` 2.0 the displacement is 1.49 per
+  node in a `[-1, 1]` box and 44% of perturbed nodes clip at the boundary --
+  those are random extreme plans, not perturbations, and their labels sit at
+  1.7% ESS.  A ladder `{0.25, 0.5, 1.0, 1.5}` across the four perturbed slots
+  puts the whole dataset in 15-46% ESS.  Unlike the temperature, a per-query
+  distance is legitimate: the query is part of the network's *input*, so
+  different distances are different inputs rather than contradictory targets for
+  the same one.
 - Pick that temperature by measured concentration, not by inheriting DIAL's
   0.05.  At 0.05 the update is a hard argmax -- effective sample size 1.1 out of
   2049 -- so a score label is one lucky sample, not an average.  Because DIAL

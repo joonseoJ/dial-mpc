@@ -53,7 +53,7 @@ class CloudCollectionTest(unittest.TestCase):
         cls.data, cls.stats = collect(
             cls.env, cls.mbdpi, cls.dial_config, cls.basis,
             jax.random.PRNGKey(0), num_steps=2, num_envs=2, repeats=2,
-            perturbations=2, temperature=TEMPERATURE, std_normalize=False,
+            perturb_scales=(0.25, 1.0), temperature=TEMPERATURE, std_normalize=False,
             episode_steps=4, init_passes=1, steps_per_call=2, progress=False,
         )
         relabel, ess = make_relabeler(cls.mbdpi, cls.dial_config)

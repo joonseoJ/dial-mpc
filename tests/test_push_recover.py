@@ -272,3 +272,79 @@ class OmegaConventionTest(unittest.TestCase):
         self.assertGreater(np.abs(got - wanted).max() / np.abs(wanted).max(), 0.1)
         # Not merely mis-scaled: the realised direction is uneven too.
         self.assertGreater(got.max() / got.min() - 1.0, 0.05)
+
+
+class ComposedPolicyCoefficientTest(unittest.TestCase):
+    """The composition solve as the deployed policy actually performs it."""
+
+    @staticmethod
+    def _policy(temperatures=None):
+        from csm.basis_screen import build_omegas
+        from csm.dial_score import ComposedDialScorePolicy
+        from csm.omega import nu_matrix
+
+        basis = np.stack([np.asarray(build_omegas(4)[f"boost{i}"]) for i in range(4)])
+        common = dict(
+            policies=(), mode_weights=jnp.asarray(basis),
+            pinv_mode_weights=jnp.asarray(np.linalg.pinv(basis)),
+        )
+        if temperatures is None:
+            return basis, ComposedDialScorePolicy(**common)
+        return basis, ComposedDialScorePolicy(
+            basis_temperatures=jnp.asarray(temperatures),
+            temperature=float(temperatures[0]),
+            pinv_nu_weights=jnp.asarray(
+                np.linalg.pinv(nu_matrix(basis, temperatures))
+            ),
+            **common,
+        )
+
+    def test_reduces_to_a_single_field(self):
+        basis, policy = self._policy([0.25] * 4)
+        for row in range(4):
+            np.testing.assert_allclose(
+                np.asarray(policy.coefficients(jnp.asarray(basis[row]))),
+                np.eye(4)[row], atol=1e-6,
+            )
+
+    def test_incoming_weight_scale_is_irrelevant(self):
+        """Normalisation at the boundary, seen from the composition side."""
+
+        _, policy = self._policy([0.25] * 4)
+        one = np.asarray(policy.coefficients(jnp.asarray([1.0, 2.0, 0.5, 1.5])))
+        seven = np.asarray(policy.coefficients(jnp.asarray([7.0, 14.0, 3.5, 10.5])))
+        np.testing.assert_allclose(one, seven, atol=1e-6)
+
+    def test_retempering_scales_the_coefficients(self):
+        _, policy = self._policy([0.25] * 4)
+        target = jnp.asarray([1.0, 1.0, 1.0, 1.0])
+        base = np.asarray(policy.coefficients(target))
+        sharper = np.asarray(policy.coefficients(target, 0.125))
+        np.testing.assert_allclose(sharper, 2.0 * base, rtol=1e-5)
+
+    def test_magnitude_is_recovered_not_guessed(self):
+        """What the sum-to-one rescale could only approximate.
+
+        The nu solve reproduces the requested natural parameter exactly; the
+        legacy solve normalises the coefficients to sum to one, which is a
+        different vector whenever that sum is not already one.
+        """
+
+        from csm.omega import nu_matrix
+
+        basis, policy = self._policy([0.25] * 4)
+        _, legacy = self._policy(None)
+        target = np.ones(4) / 2.0                      # unit uniform
+        nu = nu_matrix(basis, [0.25] * 4)
+
+        exact = np.asarray(policy.coefficients(jnp.asarray(target))) @ nu
+        np.testing.assert_allclose(exact, target / 0.25, rtol=1e-5)
+
+        guessed = np.asarray(legacy.coefficients(jnp.asarray(target))) @ nu
+        self.assertAlmostEqual(
+            float(np.asarray(legacy.coefficients(jnp.asarray(target))).sum()),
+            1.0, places=5,
+        )
+        self.assertGreater(
+            np.abs(guessed - target / 0.25).max() / (target / 0.25).max(), 0.1
+        )

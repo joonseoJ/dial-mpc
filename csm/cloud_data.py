@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 
 from csm.dial_lean import make_sampler
+from csm.dial_score import DialScoreData
 from csm.omega import normalize_omega
 
 
@@ -121,34 +122,93 @@ def make_relabeler(mbdpi, dial_config):
 
     def relabel(data: DialCloudData, omega, temperature, std_normalize=False,
                 repeats: int | None = None):
-        """Mean update over ``repeats`` clouds, plus its Monte-Carlo spread."""
+        """Mean update over ``repeats`` clouds, plus its Monte-Carlo spread.
+
+        ``temperature`` may be a scalar or one value per query, which is what a
+        per-level profile needs: the temperature that puts the fine level at a
+        usable effective sample size leaves the coarse level near an argmax, so
+        the two levels are labelled at different sharpness.
+        """
 
         omega = normalize_omega(omega)
-        temperature = jnp.asarray(temperature, dtype=jnp.float32)
+        temperature = jnp.broadcast_to(
+            jnp.asarray(temperature, dtype=jnp.float32), (data.size,)
+        )
         used = data.repeats if repeats is None else min(int(repeats), data.repeats)
 
-        def per_query(u, noise, keys, terms):
+        def per_query(u, noise, keys, terms, temp):
             deltas = jax.vmap(
-                lambda key, term: one(u, noise, key, term, omega, temperature,
+                lambda key, term: one(u, noise, key, term, omega, temp,
                                       std_normalize)
             )(keys[:used], terms[:used])
             return deltas.mean(axis=0), jnp.sqrt(jnp.mean(jnp.var(deltas, axis=0)))
 
         return jax.vmap(per_query)(
-            data.u, data.noise, data.sample_rng, data.terms
+            data.u, data.noise, data.sample_rng, data.terms, temperature
         )
 
     def ess(data: DialCloudData, omega, temperature, std_normalize=False):
         """Effective sample size of the weighting each label came from."""
 
         omega = normalize_omega(omega)
+        temperature = jnp.broadcast_to(
+            jnp.asarray(temperature, dtype=jnp.float32), (data.size,)
+        )
 
-        def per_cloud(terms):
+        def per_cloud(terms, temp):
             returns = terms @ omega
             scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
-            weights = jax.nn.softmax((returns - returns[-1]) / scale / temperature)
+            weights = jax.nn.softmax((returns - returns[-1]) / scale / temp)
             return 1.0 / jnp.sum(weights**2)
 
-        return jax.vmap(jax.vmap(per_cloud))(data.terms)
+        return jax.vmap(
+            lambda terms, temp: jax.vmap(per_cloud, in_axes=(0, None))(terms, temp)
+        )(data.terms, temperature)
 
     return relabel, ess
+
+
+def chunked(fn, data: DialCloudData, chunk: int, *args):
+    """Apply a per-query function in blocks, accumulating on the host.
+
+    Relabelling regenerates every sampled node trajectory, which is ~700 KB per
+    cloud.  Vmapping that across a whole collection would ask for terabytes of
+    device memory even though the stored costs are only tens of gigabytes, so
+    the sweep has to be blocked.
+    """
+
+    outputs = None
+    for start in range(0, data.size, chunk):
+        stop = min(start + chunk, data.size)
+        piece = jax.tree.map(lambda x: jnp.asarray(x[start:stop]), data)
+        block = fn(piece, *[
+            jnp.asarray(a[start:stop]) if getattr(a, "ndim", 0) and
+            getattr(a, "shape", (0,))[0] == data.size else a for a in args
+        ])
+        block = jax.tree.map(np.asarray, block)
+        if outputs is None:
+            outputs = [[] for _ in block]
+        for store, value in zip(outputs, block):
+            store.append(value)
+    return tuple(np.concatenate(store) for store in outputs)
+
+
+def query_temperatures(clouds: DialCloudData, temperature: float, level_scales):
+    """The per-query temperature implied by a per-level profile."""
+
+    scales = jnp.asarray(level_scales, dtype=jnp.float32)
+    return scales[jnp.asarray(clouds.level, dtype=jnp.int32)] * temperature
+
+
+def to_score_data(clouds: DialCloudData, delta: jax.Array) -> DialScoreData:
+    """Package relabelled updates as a training set.
+
+    Everything except the label already lives in the cloud file, so switching
+    weight, temperature or repeat count produces a new training set without
+    touching the environment.
+    """
+
+    return DialScoreData(
+        u=clouds.u, factor=clouds.factor, level=clouds.level, delta=delta,
+        obs=clouds.obs, qpos=clouds.qpos, qvel=clouds.qvel, step=clouds.step,
+    )

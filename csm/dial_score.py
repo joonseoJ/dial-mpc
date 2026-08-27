@@ -84,6 +84,8 @@ from tqdm.auto import tqdm
 
 from csm.architectures import MLP
 
+from csm.omega import normalize_omega
+
 
 # --------------------------------------------------------------------------- #
 # DIAL annealing schedule
@@ -1456,6 +1458,13 @@ class DialScorePolicy:
     factors: jax.Array
     shift_matrix: jax.Array
     dt: float = 1.0
+    # Sampling temperature the labels were generated at, and the per-level
+    # multiplier applied to it.  A field is the score of a specific Gibbs
+    # distribution, so the temperature is part of what it *is*: composing two
+    # fields fitted at different temperatures without carrying them gets both
+    # the sharpness and the direction wrong.
+    temperature: float | None = None
+    level_scales: jax.Array | None = None
 
     def save(self, path: str | Path) -> None:
         with open(path, "wb") as stream:
@@ -1543,6 +1552,13 @@ class ComposedDialScorePolicy:
     policies: tuple[DialScorePolicy, ...]
     mode_weights: jax.Array
     pinv_mode_weights: jax.Array
+    # One temperature per basis field, and the temperature composition targets
+    # default to.  Absent (None) means the fields were fitted under DIAL's
+    # spread normalisation, where the weight scale is inert and the legacy
+    # sum-to-one solve is the only thing that can recover a magnitude.
+    basis_temperatures: jax.Array | None = None
+    temperature: float | None = None
+    pinv_nu_weights: jax.Array | None = None
 
     def save(self, path: str | Path) -> None:
         with open(path, "wb") as stream:
@@ -1553,15 +1569,45 @@ class ComposedDialScorePolicy:
         with open(path, "rb") as stream:
             return cloudpickle.load(stream)
 
-    def coefficients(self, omega: jax.Array) -> jax.Array:
-        """Sum-normalised least-squares composition coefficients."""
+    def coefficients(
+        self, omega: jax.Array, target_temperature: jax.Array | None = None
+    ) -> jax.Array:
+        """Composition coefficients for a target weight and sharpness.
 
-        coefficients = jnp.asarray(omega, dtype=jnp.float32) @ self.pinv_mode_weights
-        total = jnp.sum(coefficients)
-        # A zero sum means omega is orthogonal to the basis span; leave the raw
-        # coefficients rather than dividing by ~0 and returning garbage.
-        return jnp.where(
-            jnp.abs(total) > 1e-6, coefficients / total, coefficients
+        Field ``i`` was fitted at ``(omega_i, T_i)`` and therefore learned the
+        score of the natural parameter ``nu_i = omega_i / T_i`` -- temperature
+        included.  Asking for ``omega*`` at ``T*`` means solving
+
+            sum_i a_i nu_i = omega* / T*
+
+        which is the same least squares as before, in nu rather than omega.
+        With one shared temperature the two differ only by a scale, but that
+        scale is exactly the magnitude the old sum-to-one rescale was guessing
+        at; solving in nu recovers it instead.  Any per-level temperature
+        profile cancels here, because it multiplies every field and the target
+        alike, so these coefficients are the same at every annealing level.
+
+        Falls back to the legacy sum-normalised omega solve for policies saved
+        before temperatures were recorded, where the spread normalisation had
+        already destroyed the magnitude.
+        """
+
+        omega = jnp.asarray(omega, dtype=jnp.float32)
+        if getattr(self, "pinv_nu_weights", None) is None:
+            coefficients = omega @ self.pinv_mode_weights
+            total = jnp.sum(coefficients)
+            # A zero sum means omega is orthogonal to the basis span; leave the
+            # raw coefficients rather than dividing by ~0 and returning garbage.
+            return jnp.where(
+                jnp.abs(total) > 1e-6, coefficients / total, coefficients
+            )
+
+        temperature = (
+            self.temperature if target_temperature is None else target_temperature
+        )
+        direction = normalize_omega(omega)
+        return (direction / jnp.asarray(temperature, dtype=jnp.float32)) @ (
+            self.pinv_nu_weights
         )
 
     def shift(self, plan: jax.Array) -> jax.Array:

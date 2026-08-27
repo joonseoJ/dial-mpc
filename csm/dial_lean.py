@@ -79,14 +79,19 @@ def mppi_logits(returns, temp, std_normalize: bool = True):
 
 
 def make_lean_update(env, mbdpi, dial_config, std_normalize: bool = True):
-    """One DIAL annealing pass, identical to `reverse_once` but state-free."""
+    """One DIAL annealing pass, identical to `reverse_once` but state-free.
+
+    The temperature is an argument rather than a constant so a caller can give
+    each annealing level its own.
+    """
 
     sample = make_sampler(mbdpi, dial_config)
     rollout = make_rollout(env)
     rollout_vmap = jax.vmap(rollout, in_axes=(None, 0))
-    temp = dial_config.temp_sample
+    default_temp = dial_config.temp_sample
 
-    def update(state, rng, plan, noise_scale):
+    def update(state, rng, plan, noise_scale, temp=None):
+        temp = default_temp if temp is None else temp
         rng, sample_rng = jax.random.split(rng)
         nodes = sample(sample_rng, plan, noise_scale)
         us = mbdpi.node2u_vvmap(nodes)
@@ -98,23 +103,43 @@ def make_lean_update(env, mbdpi, dial_config, std_normalize: bool = True):
 
 
 def make_dial_step(env, mbdpi, dial_config, n_diffuse: int | None = None,
-                   std_normalize: bool = True):
-    """One closed-loop DIAL control step: shift, anneal, act."""
+                   std_normalize: bool = True, level_scales=None):
+    """One closed-loop DIAL control step: shift, anneal, act.
+
+    `level_scales` multiplies the temperature per annealing level.  Without the
+    spread normalisation a fixed temperature means very different sharpness at
+    each level, because a coarse level perturbs the plan far enough to knock the
+    robot over and its returns spread accordingly -- measured on this plant, the
+    temperature that puts the fine level at 40% effective sample size leaves the
+    coarse level near an argmax, a factor of 3.2 apart.  Scaling the temperature
+    with the level is the fix, and because the same profile applies to every
+    weight vector it cancels out of the composition coefficients entirely.
+    """
 
     update = make_lean_update(env, mbdpi, dial_config, std_normalize)
     sigma = mbdpi.sigma_control
     n_diffuse = dial_config.Ndiffuse if n_diffuse is None else n_diffuse
     factors = dial_config.traj_diffuse_factor ** jnp.arange(n_diffuse)
+    if level_scales is None:
+        scales = jnp.ones_like(factors)
+    else:
+        scales = jnp.asarray(level_scales, dtype=factors.dtype)
+        if scales.shape != factors.shape:
+            raise ValueError(
+                f"level_scales must have {factors.shape[0]} entries, one per level"
+            )
+    temps = scales * dial_config.temp_sample
 
     def control_step(state, rng, plan):
         plan = mbdpi.shift(plan)
 
-        def anneal(carry, factor):
+        def anneal(carry, level):
             key, current = carry
-            key, current = update(state, key, current, sigma * factor)
+            factor, temp = level
+            key, current = update(state, key, current, sigma * factor, temp)
             return (key, current), None
 
-        (rng, plan), _ = jax.lax.scan(anneal, (rng, plan), factors)
+        (rng, plan), _ = jax.lax.scan(anneal, (rng, plan), (factors, temps))
         return env.step(state, plan[0]), rng, plan
 
     return control_step

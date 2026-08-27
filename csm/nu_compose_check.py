@@ -118,6 +118,9 @@ def main() -> None:
                         default=[0.25, 0.30, 0.37, 0.39])
     parser.add_argument("--target-temps", type=float, nargs="+",
                         default=[0.25, 0.30, 0.37])
+    parser.add_argument("--targets", nargs="+", default=None,
+                        help="weight directions to compose, as comma-separated "
+                             "vectors; defaults to a set of interior points")
     parser.add_argument("--states", type=int, default=16)
     parser.add_argument("--chunk", type=int, default=8)
     parser.add_argument("--warmup-steps", type=int, default=4)
@@ -151,13 +154,19 @@ def main() -> None:
         targets.append((f"{name}@own", catalogue[name], float(temp)))
     targets.append((f"{args.basis[0]}@retemper",
                     catalogue[args.basis[0]], float(basis_temps[-1])))
-    interior = {
-        "uniform": np.ones(n_rows),
-        "(2,1,1,1)": np.array([2.0, 1.0, 1.0, 1.0][:n_rows]),
-        "(1,2,2,1)": np.array([1.0, 2.0, 2.0, 1.0][:n_rows]),
-        "(1,1,2,2)": np.array([1.0, 1.0, 2.0, 2.0][:n_rows]),
-        "(3,2,1,1)": np.array([3.0, 2.0, 1.0, 1.0][:n_rows]),
-    }
+    if args.targets:
+        interior = {
+            name: np.array([float(v) for v in name.split(",")])
+            for name in args.targets
+        }
+    else:
+        interior = {
+            "uniform": np.ones(n_rows),
+            "(2,1,1,1)": np.array([2.0, 1.0, 1.0, 1.0][:n_rows]),
+            "(1,2,2,1)": np.array([1.0, 2.0, 2.0, 1.0][:n_rows]),
+            "(1,1,2,2)": np.array([1.0, 1.0, 2.0, 2.0][:n_rows]),
+            "(3,2,1,1)": np.array([3.0, 2.0, 1.0, 1.0][:n_rows]),
+        }
     for name, vec in interior.items():
         for temp in args.target_temps:
             targets.append((f"{name}@{temp:g}", normalize_omega_np(vec), float(temp)))
