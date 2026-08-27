@@ -1097,9 +1097,333 @@ class UnitreeGo2PushRecoverEnv(UnitreeGo2Env):
         )
 
 
+@dataclass
+class UnitreeGo2GaitChoiceEnvConfig(UnitreeGo2EnvConfig):
+    """Velocity-command locomotion where the weight picks *how* to walk.
+
+    The walking basis failed because every row was a deviation penalty against
+    the same nominal trot.  Rows that share an argmin leave omega nothing to
+    do but change the curvature of one basin, and the cross-evaluation showed
+    exactly that.  So this task deletes the gait reference: there is no
+    ``z_feet_tar``, and the target foot height is kept out of the observation.
+    Nothing tells the robot which gait to use.  The rows say only what the
+    operator cares about, and the gait is what omega is left to choose.
+
+    The conflict between the rows is mechanical rather than tuned.  At a
+    commanded speed v a gait is fixed by its period T and its duty factor D
+    (the fraction of the cycle a foot spends on the ground), and steady
+    locomotion forces
+
+        mean normal force per stance foot   F = m g / (4 D)
+        ballistic torso bounce              dz = g (1 - 2D)^2 T^2 / 8
+        swing power per leg                 P ~ m_l v^2 / ((1 - D)^2 T)
+
+    Reading the signs off those three: transport efficiency wants D down and
+    T up, payload stability wants D up and T down, contact gentleness wants D
+    up and T up.  Rows 1 and 2 are antipodal in both coordinates and row 3 is
+    parallel to neither, so three non-parallel directions compete in a
+    two-dimensional space and no gait is optimal for all of them.  That is the
+    property the walking rows did not have.
+    """
+
+    # No gait reference anywhere.  "stand" only selects the (unused) phase
+    # table; the reward never reads it and the observation never carries it.
+    gait: str = "stand"
+    include_foot_height_observation: bool = False
+    enable_body_collisions: bool = True
+    terminate_on_joint_limit: bool = False
+
+    # The trade-off only exists near the actuation envelope.  At a stroll all
+    # four rows agree on the same comfortable trot, which is the walking task
+    # all over again, so the default command is deliberately brisk.
+    default_vx: float = 1.2
+    default_vy: float = 0.0
+    default_vyaw: float = 0.0
+    ramp_up_time: float = 0.4
+    nominal_height: float = 0.30
+
+    # Command envelope.  Wider than the trot env's because the point of the
+    # task is that one score field has to cover the whole joystick, turns
+    # included, not a single straight line.
+    command_vx_min: float = -0.6
+    command_vx_max: float = 1.6
+    command_vy_min: float = -0.6
+    command_vy_max: float = 0.6
+    command_vyaw_min: float = -1.6
+    command_vyaw_max: float = 1.6
+
+    # Row normalizers.  Seeds only: the screen measures each row's standard
+    # deviation across the DIAL sample cloud and rescales so all four are
+    # comparable, which is what makes the *direction* of omega meaningful and
+    # lets a temperature be quoted.
+    track_scale: float = 0.10
+    energy_scale: float = 100.0
+    payload_scale: float = 1.00
+    contact_scale: float = 0.50
+
+    # Rows 1-3 are priced per unit of *delivered* command rather than per
+    # second when this is positive.  Priced per second, the realised speed
+    # explained 92% of the energy row and 93% of the contact row: the cheapest
+    # way to lower any rate per unit time is to move less, one shared direction
+    # that collapsed a nominally four-row basis to an effective rank of 1.85.
+    #
+    # Dividing by the raw speed removes that but opens a worse hole.  A penalty
+    # over |v| always shrinks as |v| grows, and inside a 0.64 s horizon the
+    # cheapest way to make |v| large is to launch the body ballistically --
+    # measured, the planner did exactly that: 100% flight phase, no foot
+    # contact at all, an apparent cost of transport of 0.33 against a trot's
+    # 1.0, and a fall within two control steps.
+    #
+    # So the divisor is clipped at the commanded speed and expressed as a
+    # fraction of it.  At the commanded speed the rows read their per-second
+    # value; below it they inflate (a standstill pays 20x); above it nothing
+    # further is gained, which closes the ballistic exploit.  With no
+    # translation commanded the cap collapses to the floor and the rows are
+    # per-second again, which is the right reading when "per metre" is
+    # meaningless.
+    speed_floor: float = 0.0
+    # Row 1: copper loss coefficient, W per (N m)^2.  A Go2 joint is a 0.1 ohm
+    # motor behind a 6.33:1 gear with k_t about 0.3 N m / A, so holding torque
+    # costs R (tau / (6.33 k_t))^2 ~ 0.03 tau^2.  Without it "energy" would be
+    # free at standstill and the row would price only motion.
+    copper_coeff: float = 0.03
+    # Search assistance, kept strictly out of the objective.  Sampling MPC will
+    # not discover a gait from a standing plan: standing is a local optimum, and
+    # a sampled step pays support, impulse and swing work immediately while the
+    # progress it buys arrives later.  The original DIAL-MPC trot config solves
+    # this with a foot-height reference -- which is exactly the prescription
+    # that made the walking basis non-discriminative.  So the reference lives
+    # here, switched off by default, and is used only to drive a bootstrap
+    # instance that puts the planner into a trotting basin.  Every measured
+    # number comes from an instance with this at zero.
+    bootstrap_gait_weight: float = 0.0
+    # Row 3: price of a missing stance foot.  The mean over a cycle is
+    # 4 (1 - D), so this term is a linear price on the duty factor itself.
+    support_weight: float = 0.25
+
+    reward_weights: jax.Array = field(
+        default_factory=lambda: jnp.array([1.0, 1.0, 1.0, 1.0])
+    )
+
+
+class UnitreeGo2GaitChoiceEnv(UnitreeGo2Env):
+    """Four rows describing what the operator cares about, not how to walk.
+
+      0. command tracking    -- body-frame linear velocity and yaw rate
+      1. transport efficiency -- positive joint work plus copper loss
+      2. payload stability   -- what a carried camera or cargo feels
+      3. contact gentleness  -- touchdown impulse and stance support
+
+    Rows 1-3 are all trivially satisfied by standing still, exactly as rows
+    1-3 of the push-recovery basis were satisfied by not moving.  What makes
+    them separable there was the impulse; what makes them separable here is
+    row 0, which is present at weight 1 in every basis weight the screen and
+    the training grid use.  A pure e_i corner is allowed to be degenerate.
+    """
+
+    def __init__(self, config: UnitreeGo2GaitChoiceEnvConfig):
+        super().__init__(config)
+        self._total_mass = float(jnp.sum(self.sys.mj_model.body_mass))
+
+    # ------------------------------------------------------------------ #
+    # observation
+    # ------------------------------------------------------------------ #
+    def _get_obs(self, pipeline_state, state_info) -> jax.Array:
+        """Command, proprioception and contact -- no world position, no phase.
+
+        The rows are functions of velocity, acceleration and contact alone, so
+        the optimal policy is stationary in time and in place.  Feeding the
+        world x/y of a robot that walks away forever would be the one input
+        guaranteed to leave the training distribution, and the gait phase is
+        deliberately absent because prescribing it is what broke the walking
+        basis.
+        """
+        x, xd = pipeline_state.x, pipeline_state.xd
+        torso = self._torso_idx - 1
+        vb = global_to_body_velocity(xd.vel[torso], x.rot[torso])
+        ab = global_to_body_velocity(xd.ang[torso], x.rot[torso])
+        foot_z = (
+            pipeline_state.site_xpos[self._feet_site_id][:, 2] - self._foot_radius
+        )
+        return jnp.concatenate(
+            [
+                state_info["vel_tar"][:2],
+                state_info["ang_vel_tar"][2:3],
+                pipeline_state.ctrl,
+                pipeline_state.qpos[2:],          # height, quaternion, joints
+                vb,
+                ab,
+                pipeline_state.qvel[6:],
+                foot_z,
+                (foot_z < 1e-3).astype(jnp.float32),
+            ]
+        )
+
+    # ------------------------------------------------------------------ #
+    # reset
+    # ------------------------------------------------------------------ #
+    def reset(self, rng: jax.Array) -> State:  # pytype: disable=signature-mismatch
+        state = super().reset(rng)
+        pipeline_state = state.pipeline_state
+        torso = self._torso_idx - 1
+        foot_z = (
+            pipeline_state.site_xpos[self._feet_site_id][:, 2] - self._foot_radius
+        )
+        # Rows 2 and 3 read accelerations and touchdown speeds, which are
+        # differences across a control step.  Seeding the "last" fields from
+        # the reset state itself makes the first step's differences zero
+        # instead of a spurious spike.
+        state.info["last_vz"] = pipeline_state.xd.vel[torso][2]
+        state.info["last_foot_z"] = foot_z
+        state.info["last_contact"] = foot_z < 1e-3
+        state.info["reward_weights"] = normalize_omega(
+            state.info["reward_weights"]
+        )
+        state.info["reward_terms"] = jnp.zeros(4)
+        state.info["n_contact"] = jnp.sum((foot_z < 1e-3).astype(jnp.float32))
+        state.info["power"] = jnp.zeros(())
+        return state.replace(obs=self._get_obs(pipeline_state, state.info))
+
+    # ------------------------------------------------------------------ #
+    # step
+    # ------------------------------------------------------------------ #
+    def step(self, state: State, action: jax.Array) -> State:
+        rng, cmd_rng = jax.random.split(state.info["rng"], 2)
+
+        if self._config.leg_control == "position":
+            ctrl = self.act2joint(action)
+            pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
+        else:
+            pipeline_state = self.pd_pipeline_step(state.pipeline_state, action)
+        x, xd = pipeline_state.x, pipeline_state.xd
+        torso = self._torso_idx - 1
+
+        resample_steps = max(int(self._config.command_resample_steps), 1)
+        should_resample = (
+            state.info["randomize_target"]
+            & (state.info["step"] > 0)
+            & (state.info["step"] % resample_steps == 0)
+        )
+        vel_cmd, ang_vel_cmd = jax.lax.cond(
+            should_resample,
+            lambda: self.sample_command(cmd_rng),
+            lambda: (state.info["vel_cmd"], state.info["ang_vel_cmd"]),
+        )
+        command_scale = self._command_ramp_scale(state.info["step"])
+        vel_tar = vel_cmd * command_scale
+        ang_vel_tar = ang_vel_cmd * command_scale
+
+        vb = global_to_body_velocity(xd.vel[torso], x.rot[torso])
+        # brax reports xd.ang in rad/s already.  The trot env multiplies it by
+        # pi/180 before comparing against the yaw-rate command, which is
+        # harmless there only because every shipped config commands zero yaw
+        # rate.  This task commands turns, so the conversion is dropped.
+        ab = global_to_body_velocity(xd.ang[torso], x.rot[torso])
+
+        # Row 0 -- command tracking.  The mission, and the only row that is
+        # not satisfied by standing still.
+        track_err = jnp.sum(jnp.square(vb[:2] - vel_tar[:2])) + jnp.square(
+            ab[2] - ang_vel_tar[2]
+        )
+        reward_track = -track_err / self._config.track_scale
+
+        # Row 1 -- transport efficiency.  Positive mechanical work (no
+        # regeneration) plus resistive loss.  Wants long strides at low
+        # cadence and will happily let the torso bounce, because ballistic
+        # flight is free.
+        tau = pipeline_state.ctrl
+        joint_vel = pipeline_state.qvel[6:]
+        power = jnp.sum(jnp.maximum(tau * joint_vel, 0.0)) + (
+            self._config.copper_coeff * jnp.sum(jnp.square(tau))
+        )
+        if self._config.speed_floor > 0.0:
+            floor = self._config.speed_floor
+            cap = jnp.maximum(jnp.linalg.norm(vel_tar[:2]), floor)
+            progress = jnp.clip(
+                jnp.linalg.norm(xd.vel[torso][:2]), floor, cap
+            ) / cap
+        else:
+            progress = 1.0
+        reward_energy = -power / progress / self._config.energy_scale
+
+        # Row 2 -- payload stability.  Vertical acceleration and roll/pitch
+        # rate are what a carried camera or cargo actually feels.  No height
+        # setpoint and no attitude setpoint: prescribing a posture here would
+        # reintroduce the walking basis's shared argmin.
+        accel_z = (xd.vel[torso][2] - state.info["last_vz"]) / self.dt
+        payload_err = jnp.square(accel_z / 9.81) + jnp.sum(jnp.square(ab[:2]))
+        reward_payload = -payload_err / progress / self._config.payload_scale
+
+        # Row 3 -- contact gentleness.  Touchdown vertical speed prices how
+        # hard the foot lands; the stance deficit averages 4 (1 - D) over a
+        # cycle, which is a direct linear price on the duty factor and hence,
+        # through F = m g / (4 D), on the peak normal force.
+        foot_z = (
+            pipeline_state.site_xpos[self._feet_site_id][:, 2] - self._foot_radius
+        )
+        foot_zdot = (foot_z - state.info["last_foot_z"]) / self.dt
+        contact = foot_z < 1e-3
+        touchdown = contact & jnp.logical_not(state.info["last_contact"])
+        impact = jnp.sum(
+            jnp.square(jnp.maximum(-foot_zdot, 0.0))
+            * touchdown.astype(jnp.float32)
+        )
+        n_contact = jnp.sum(contact.astype(jnp.float32))
+        reward_contact = -(
+            impact + self._config.support_weight * (4.0 - n_contact)
+        ) / progress / self._config.contact_scale
+
+        reward_components = jnp.stack(
+            [reward_track, reward_energy, reward_payload, reward_contact]
+        )
+        weights = normalize_omega(state.info["reward_weights"])
+        reward = jnp.dot(weights, reward_components)
+
+        # Bootstrap only.  A Python-level branch on a config float, so it is
+        # static under jit and simply absent from the measured instance.
+        if self._config.bootstrap_gait_weight > 0.0:
+            duty_ratio, cadence, amplitude = self._gait_params[self._config.gait]
+            phases = self._gait_phase[self._config.gait]
+            z_tar = get_foot_step(
+                duty_ratio, cadence, amplitude, phases,
+                state.info["step"] * self.dt,
+            )
+            z_now = pipeline_state.site_xpos[self._feet_site_id][:, 2]
+            reward = reward - self._config.bootstrap_gait_weight * 0.1 * jnp.sum(
+                ((z_tar - z_now) / 0.05) ** 2
+            )
+
+        up = jnp.array([0.0, 0.0, 1.0])
+        done = jnp.dot(math.rotate(up, x.rot[torso]), up) < 0.0
+        done |= x.pos[torso][2] < 0.18
+        done = done.astype(jnp.float32)
+
+        state.info["rng"] = rng
+        state.info["step"] += 1
+        state.info["vel_cmd"] = vel_cmd
+        state.info["ang_vel_cmd"] = ang_vel_cmd
+        state.info["vel_tar"] = vel_tar
+        state.info["ang_vel_tar"] = ang_vel_tar
+        state.info["last_vz"] = xd.vel[torso][2]
+        state.info["last_foot_z"] = foot_z
+        state.info["last_contact"] = contact
+        state.info["reward_weights"] = weights
+        state.info["reward_terms"] = reward_components
+        state.info["n_contact"] = n_contact
+        state.info["power"] = power
+
+        obs = self._get_obs(pipeline_state, state.info)
+        return state.replace(
+            pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
+        )
+
+
 brax_envs.register_environment("unitree_go2_walk", UnitreeGo2Env)
 brax_envs.register_environment("unitree_go2_seq_jump", UnitreeGo2SeqJumpEnv)
 brax_envs.register_environment("unitree_go2_crate_climb", UnitreeGo2CrateEnv)
 brax_envs.register_environment(
     "unitree_go2_push_recover", UnitreeGo2PushRecoverEnv
+)
+brax_envs.register_environment(
+    "unitree_go2_gait_choice", UnitreeGo2GaitChoiceEnv
 )
