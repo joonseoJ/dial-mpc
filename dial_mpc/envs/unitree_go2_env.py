@@ -1418,6 +1418,238 @@ class UnitreeGo2GaitChoiceEnv(UnitreeGo2Env):
         )
 
 
+@dataclass
+class UnitreeGo2WalkRecoverEnvConfig(UnitreeGo2GaitChoiceEnvConfig):
+    """Absorb a push while walking.  The weight picks which strategy pays.
+
+    The gait-choice basis failed for a reason worth stating plainly: it mixed a
+    *mission* row with *preference* rows.  Being 1.2 m/s off the command is a
+    large cost; burning 20 W more is a small one, and no normalisation makes
+    those commensurate.  Equalising their spread across the sample cloud took
+    the diagonal from 2/4 to 9/9 but left the robot ignoring its command; the
+    two properties could not hold at once.
+
+    The push-recovery basis had no such asymmetry, because every row was a
+    deviation-from-nominal penalty and the mission -- stay standing -- was
+    enforced by the disturbance rather than by a row.  This task carries that
+    structure into locomotion.  The nominal is a steady gait at the command
+    instead of a static pose; the disturbance is an impulse the planner cannot
+    see coming; and the rows price four different channels the impulse can be
+    absorbed through.  Every row is then scaled by the same thing, the size of
+    the push.
+
+    The channels are not a taxonomy invented here.  For a legged system the
+    centre-of-mass dynamics obey
+
+        c_x_ddot = (g/z) (c_x - p_x) - L_y_dot / (m z)
+
+    with the centre of pressure p_x confined to the support polygon.  To change
+    the acceleration you must move p_x inside the polygon (ankle), spin up
+    centroidal angular momentum (hip), move the polygon itself (stepping), or
+    accept the acceleration you get and let the velocity drift.  There is no
+    fifth term.  The impulse has to be paid for out of that identity, so the
+    rows compete by construction rather than by tuning.
+    """
+
+    gait: str = "trot"
+    # Impulse applied to the floating base, in m/s, sampled in
+    # [push_scale_min, 1] * push_linear_velocity with a random heading.  The
+    # harness applies it between control steps so the planner never sees it
+    # inside its own rollout -- an anticipated push is not a disturbance.
+    push_linear_velocity: float = 0.6
+    push_scale_min: float = 0.4
+
+    # Deadbands, in the raw units of rows 1 and 2.  Both rows measure an
+    # absolute magnitude, and a robot that stops walking has less of either,
+    # so without these the trunk row is minimised by standing still -- measured,
+    # the trunk-boosted weight walked with a duty factor of 0.92-1.00 and took
+    # no steps at all before the push, which is not a recovery strategy but a
+    # refusal to walk.  Set just above what steady walking produces (0.09 rad^2
+    # of squared trunk rate, 420 (N m)^2 of squared torque), so normal
+    # locomotion sits inside the band and costs nothing, and only what the
+    # disturbance adds is priced.
+    trunk_baseline: float = 0.10
+    effort_baseline: float = 450.0
+
+    # Row normalizers.  Seeds: the screen measures each row's spread across the
+    # sample cloud and equalises them at constant total magnitude, the
+    # procedure that brought the gait-choice rows from a 15x imbalance to 1.8x.
+    step_scale: float = 0.02
+    trunk_scale: float = 2.0
+    effort_scale: float = 500.0
+    velocity_scale: float = 0.10
+
+    reward_weights: jax.Array = field(
+        default_factory=lambda: jnp.array([1.0, 1.0, 1.0, 1.0])
+    )
+
+
+class UnitreeGo2WalkRecoverEnv(UnitreeGo2GaitChoiceEnv):
+    """Four ways to absorb an impulse while walking.
+
+      0. stepping -- put the feet somewhere other than the command asked for
+      1. trunk    -- spend attitude and angular momentum (the hip strategy)
+      2. effort   -- push harder with the feet already down (the ankle strategy)
+      3. velocity -- absorb nothing and let the course drift
+
+    Rows 0-2 are all satisfied by walking on undisturbed, which is exactly why
+    row 3 has to be there: the impulse makes "react to nothing" cost velocity.
+    That is the same shape as the push-recovery basis, where three rows were
+    satisfied by not moving and the impulse is what made not moving expensive.
+    """
+
+    def __init__(self, config: UnitreeGo2WalkRecoverEnvConfig):
+        super().__init__(config)
+        # Nominal foot placement under the body, from the home keyframe.  Row 0
+        # measures departure from this, so it needs no gait phase and no
+        # touchdown detection.
+        init_state = self.pipeline_init(self._init_q, jnp.zeros(self._nv))
+        base_xy = init_state.x.pos[self._torso_idx - 1][:2]
+        self._nominal_foot_offset = jnp.asarray(
+            init_state.site_xpos[self._feet_site_id][:, :2] - base_xy
+        )
+
+    def reset(self, rng: jax.Array) -> State:  # pytype: disable=signature-mismatch
+        state = super().reset(rng)
+        foot_xy = state.pipeline_state.site_xpos[self._feet_site_id][:, :2]
+        # Rows read a stride against the stride the command asks for, so each
+        # foot carries where and when it last landed.
+        state.info["prev_td_pos"] = foot_xy
+        state.info["time_since_td"] = jnp.zeros(4)
+        state.info["push_speed"] = jnp.zeros(())
+        return state
+
+    def step(self, state: State, action: jax.Array) -> State:
+        rng, cmd_rng = jax.random.split(state.info["rng"], 2)
+
+        if self._config.leg_control == "position":
+            ctrl = self.act2joint(action)
+            pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
+        else:
+            pipeline_state = self.pd_pipeline_step(state.pipeline_state, action)
+        x, xd = pipeline_state.x, pipeline_state.xd
+        torso = self._torso_idx - 1
+
+        resample_steps = max(int(self._config.command_resample_steps), 1)
+        should_resample = (
+            state.info["randomize_target"]
+            & (state.info["step"] > 0)
+            & (state.info["step"] % resample_steps == 0)
+        )
+        vel_cmd, ang_vel_cmd = jax.lax.cond(
+            should_resample,
+            lambda: self.sample_command(cmd_rng),
+            lambda: (state.info["vel_cmd"], state.info["ang_vel_cmd"]),
+        )
+        command_scale = self._command_ramp_scale(state.info["step"])
+        vel_tar = vel_cmd * command_scale
+        ang_vel_tar = ang_vel_cmd * command_scale
+
+        vb = global_to_body_velocity(xd.vel[torso], x.rot[torso])
+        ab = global_to_body_velocity(xd.ang[torso], x.rot[torso])
+        up = jnp.array([0.0, 0.0, 1.0])
+        vec = math.rotate(up, x.rot[torso])
+
+        foot_pos = pipeline_state.site_xpos[self._feet_site_id]
+        foot_xy = foot_pos[:, :2]
+        foot_z = foot_pos[:, 2] - self._foot_radius
+        contact = foot_z < 1e-3
+        touchdown = contact & jnp.logical_not(state.info["last_contact"])
+        time_since = state.info["time_since_td"] + self.dt
+
+        # Row 0 -- stepping.  Where the feet sit under the body, against where
+        # the nominal stance puts them.  Walking swings each foot fore and aft
+        # about its nominal offset, a smooth phase-dependent baseline that is
+        # common to every sample from the same state and therefore cancels in
+        # the softmax; reaching out to catch the body does not cancel.
+        #
+        # The first version scored this only at touchdown.  That made the row's
+        # sample-to-sample variance a count of how many feet happened to land
+        # inside the horizon rather than a measure of where they landed, and
+        # the row ended up with 9 to 30 times the spread of the other three --
+        # enough that uniform and the stepping-boosted weight selected
+        # identical elite sets.
+        base_xy = x.pos[torso][:2]
+        yaw_rot = math.quat_to_3x3(x.rot[torso])[:2, :2]
+        offsets = (foot_xy - base_xy) @ yaw_rot
+        step_dev = jnp.sum(
+            jnp.square(offsets - self._nominal_foot_offset)
+        )
+        reward_step = -step_dev / self._config.step_scale
+
+        # Row 1 -- trunk.  The hip strategy buys centre-of-mass acceleration by
+        # spinning the body up; this is what that costs.  Priced above a
+        # walking deadband, so the row speaks about the disturbance rather than
+        # about whether the robot is walking at all.
+        trunk_err = jnp.sum(jnp.square(ab[:2])) + jnp.sum(jnp.square(vec - up))
+        reward_trunk = -jnp.maximum(
+            trunk_err - self._config.trunk_baseline, 0.0
+        ) / self._config.trunk_scale
+
+        # Row 2 -- effort.  The ankle strategy buys the same acceleration by
+        # redistributing force across the feet already on the ground, and pays
+        # for it in joint torque rather than in geometry.
+        tau = pipeline_state.ctrl
+        reward_effort = -jnp.maximum(
+            jnp.sum(jnp.square(tau)) - self._config.effort_baseline, 0.0
+        ) / self._config.effort_scale
+
+        # Row 3 -- velocity.  Absorb the impulse through none of the above and
+        # this is where it lands.  Without the disturbance the other three rows
+        # would all be satisfied by walking on undisturbed, and the basis would
+        # have nothing to argue about.
+        reward_velocity = -(
+            jnp.sum(jnp.square(vb[:2] - vel_tar[:2]))
+            + jnp.square(ab[2] - ang_vel_tar[2])
+        ) / self._config.velocity_scale
+
+        reward_components = jnp.stack(
+            [reward_step, reward_trunk, reward_effort, reward_velocity]
+        )
+        weights = normalize_omega(state.info["reward_weights"])
+        reward = jnp.dot(weights, reward_components)
+
+        if self._config.bootstrap_gait_weight > 0.0:
+            duty_ratio, cadence, amplitude = self._gait_params[self._config.gait]
+            phases = self._gait_phase[self._config.gait]
+            z_tar = get_foot_step(
+                duty_ratio, cadence, amplitude, phases,
+                state.info["step"] * self.dt,
+            )
+            reward = reward - self._config.bootstrap_gait_weight * 0.1 * jnp.sum(
+                ((z_tar - foot_pos[:, 2]) / 0.05) ** 2
+            )
+
+        done = jnp.dot(math.rotate(up, x.rot[torso]), up) < 0.0
+        done |= x.pos[torso][2] < 0.18
+        done = done.astype(jnp.float32)
+
+        state.info["rng"] = rng
+        state.info["step"] += 1
+        state.info["vel_cmd"] = vel_cmd
+        state.info["ang_vel_cmd"] = ang_vel_cmd
+        state.info["vel_tar"] = vel_tar
+        state.info["ang_vel_tar"] = ang_vel_tar
+        state.info["last_vz"] = xd.vel[torso][2]
+        state.info["last_foot_z"] = foot_z
+        state.info["last_contact"] = contact
+        state.info["prev_td_pos"] = jnp.where(
+            touchdown[:, None], foot_xy, state.info["prev_td_pos"]
+        )
+        state.info["time_since_td"] = jnp.where(touchdown, 0.0, time_since)
+        state.info["reward_weights"] = weights
+        state.info["reward_terms"] = reward_components
+        state.info["n_contact"] = jnp.sum(contact.astype(jnp.float32))
+        state.info["power"] = jnp.sum(
+            jnp.maximum(tau * pipeline_state.qvel[6:], 0.0)
+        )
+
+        obs = self._get_obs(pipeline_state, state.info)
+        return state.replace(
+            pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
+        )
+
+
 brax_envs.register_environment("unitree_go2_walk", UnitreeGo2Env)
 brax_envs.register_environment("unitree_go2_seq_jump", UnitreeGo2SeqJumpEnv)
 brax_envs.register_environment("unitree_go2_crate_climb", UnitreeGo2CrateEnv)
@@ -1426,4 +1658,7 @@ brax_envs.register_environment(
 )
 brax_envs.register_environment(
     "unitree_go2_gait_choice", UnitreeGo2GaitChoiceEnv
+)
+brax_envs.register_environment(
+    "unitree_go2_walk_recover", UnitreeGo2WalkRecoverEnv
 )
