@@ -68,6 +68,11 @@ push_scale_min: 0.4
 # Deadbands: steady walking produces about 0.09 rad^2 of squared trunk rate and
 # 420 (N m)^2 of squared torque, so rows 1 and 2 stay silent through normal
 # locomotion and price only what the push adds.
+# Row 0's deadband grows with the square of the commanded speed, because that
+# is how the nominal foot sweep grows.  Without it the row opposes walking
+# outright: at a 0.8 m/s command the robot settled at 0.25 m/s, exactly where
+# -5.08 v^2 (stepping) and -2.32 (v - 0.8)^2 (velocity) balance.
+step_baseline_coeff: 0.118
 trunk_baseline: 0.10
 effort_baseline: 450.0
 

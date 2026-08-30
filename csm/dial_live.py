@@ -70,6 +70,21 @@ from PIL import Image
 MASS_RANKS = (1, 4, 16, 64, 256, 1024)
 
 
+# Row labels per task, so the sliders are named after what they price rather
+# than "row0..row3".
+ROW_NAMES = {
+    "unitree_go2_push_recover": ["tilt", "base", "feet", "shape"],
+    "unitree_go2_gait_choice": ["track", "energy", "payload", "contact"],
+    "unitree_go2_walk_recover": ["stepping", "trunk", "effort", "velocity"],
+}
+# Tasks whose objective contains no gait reference.  Sampling MPC will not find
+# a gait from a standing plan on these -- standing is a local optimum and a
+# sampled step pays support, impulse and swing work before the horizon sees the
+# progress it buys -- so the viewer opens with a bootstrap instance that carries
+# a foot-height term, and hands its state and plan to the measured one.
+BOOTSTRAP_ENVS = ("unitree_go2_gait_choice", "unitree_go2_walk_recover")
+
+
 def _load(example: str | None, config_path: Path | None):
     if example is not None:
         config_dict = yaml.safe_load(open(get_example_path(example + ".yaml")))
@@ -147,6 +162,12 @@ class LiveDial:
 
         self._reset_env = jax.jit(self.env.reset)
         self._control = make_interactive_step(self.env, self.mbdpi, self.dial_config)
+        self._boot = None
+        if int(args.bootstrap) > 0:
+            self._build_bootstrap(env_config)
+        # Only the locomotion tasks carry a velocity command; the stand-and-
+        # resist task has no use for the sliders.
+        self._has_command = hasattr(env_config, "command_vx_max")
 
         @jax.jit
         def push(state, impulse):
@@ -172,6 +193,9 @@ class LiveDial:
         self.controls = {
             "omega": [float(v) for v in np.asarray(env_config.reward_weights)],
             "temp": float(self.dial_config.temp_sample),
+            "vx": float(getattr(env_config, "default_vx", 0.0)),
+            "vy": float(getattr(env_config, "default_vy", 0.0)),
+            "vyaw": float(getattr(env_config, "default_vyaw", 0.0)),
         }
         self.stats: dict[str, object] = {
             "status": "starting",
@@ -181,6 +205,65 @@ class LiveDial:
             "row_names": self.row_names,
             "mass_ranks": list(MASS_RANKS),
         }
+
+    def _build_bootstrap(self, env_config) -> None:
+        """A second instance of the same physics whose reward names a gait.
+
+        Its foot-height term never enters the objective the sliders drive; it
+        exists only to put the planner in a trotting basin, and the state and
+        plan it produces are what every weight starts from.
+        """
+
+        from csm.dial_lean import make_dial_step
+        from csm.gait_choice_eval import make_warm_start
+
+        boot_config = dataclasses.replace(
+            env_config,
+            gait="trot",
+            bootstrap_gait_weight=max(
+                float(getattr(env_config, "bootstrap_gait_weight", 0.0)), 1.0
+            ),
+        )
+        boot_env = brax_envs.get_environment(
+            self.dial_config.env_name, config=boot_config
+        )
+        warm = make_warm_start(boot_env, self.mbdpi, self.dial_config, True)
+        control = make_dial_step(boot_env, self.mbdpi, self.dial_config,
+                                 std_normalize=True)
+        length = int(self.args.bootstrap)
+
+        @jax.jit
+        def boot(state, rng):
+            rng, plan = warm(state, rng)
+
+            def body(carry, _):
+                st, key, pl = carry
+                st, key, pl = control(st, key, pl)
+                return (st, key, pl), None
+
+            (state, rng, plan), _ = jax.lax.scan(
+                body, (state, rng, plan), None, length=length
+            )
+            return state, plan
+
+        self._boot_reset = jax.jit(boot_env.reset)
+        self._boot = boot
+
+    def _start(self, seed: int):
+        """Fresh episode: bootstrapped into a trot where the task needs it."""
+
+        if self._boot is None:
+            state = self._reset_env(jax.random.PRNGKey(seed))
+            plan = jnp.zeros(
+                (self.dial_config.Hnode + 1, int(self.env.action_size)),
+                dtype=jnp.float32,
+            )
+            return state, plan, True
+        state = self._boot_reset(jax.random.PRNGKey(seed))
+        state, plan = self._boot(state, jax.random.PRNGKey(seed + 31))
+        # The plan is already annealed and the robot is already walking, so the
+        # first control step must shift rather than restart.
+        return state, plan, False
 
     # ---------------------------------------------------------------- frames
     def publish(self, pixels, caption: str) -> None:
@@ -206,19 +289,25 @@ class LiveDial:
         with self._lock:
             self._commands.append((name, payload))
 
-    def set_controls(self, omega=None, temp=None) -> None:
+    def set_controls(self, omega=None, temp=None, command=None) -> None:
         with self._lock:
             if omega is not None:
                 self.controls["omega"] = [float(v) for v in omega]
             if temp is not None:
                 self.controls["temp"] = max(float(temp), 1e-4)
+            if command is not None:
+                for key in ("vx", "vy", "vyaw"):
+                    if command.get(key) is not None:
+                        self.controls[key] = float(command[key])
 
     def _drain(self):
         with self._lock:
             pending, self._commands = self._commands, []
             omega = jnp.asarray(self.controls["omega"], dtype=jnp.float32)
             temp = jnp.asarray(self.controls["temp"], dtype=jnp.float32)
-        return pending, omega, temp
+            command = (float(self.controls["vx"]), float(self.controls["vy"]),
+                       float(self.controls["vyaw"]))
+        return pending, omega, temp, command
 
     # ------------------------------------------------------------ diagnostics
     def weight_report(self, weights: np.ndarray) -> dict:
@@ -255,10 +344,7 @@ class LiveDial:
         args = self.args
         seed = int(args.seed)
         rng = jax.random.PRNGKey(seed + 7919)
-        state = self._reset_env(jax.random.PRNGKey(seed))
-        plan = jnp.zeros(
-            (self.dial_config.Hnode + 1, int(self.env.action_size)), dtype=jnp.float32
-        )
+        state, plan, fresh_start = self._start(seed)
         renderer = FrameRenderer(self.env.sys, args.width, args.height, self.camera)
 
         self.stats["status"] = "compiling"
@@ -270,10 +356,10 @@ class LiveDial:
         rate_window = time.perf_counter()
         rate_steps = 0
         control_hz = 0.0
-        fresh = True
+        fresh = fresh_start
 
         while True:
-            pending, omega, temp = self._drain()
+            pending, omega, temp, command = self._drain()
             reset_now = False
             for name, payload in pending:
                 if name == "reset":
@@ -283,13 +369,22 @@ class LiveDial:
 
             if reset_now:
                 seed += 1
-                state = self._reset_env(jax.random.PRNGKey(seed))
-                plan = jnp.zeros_like(plan)
-                episode_step, episode_reward, fresh = 0, 0.0, True
+                state, plan, fresh = self._start(seed)
+                episode_step, episode_reward = 0, 0.0
 
             # The weights are read out of the state by the rollouts, so writing
             # them here is all it takes for a slider to reach the planner.
             state.info["reward_weights"] = omega
+            if self._has_command:
+                vx, vy, vyaw = command
+                linear = jnp.array([vx, vy, 0.0], dtype=jnp.float32)
+                angular = jnp.array([0.0, 0.0, vyaw], dtype=jnp.float32)
+                state.info["vel_cmd"] = linear
+                state.info["ang_vel_cmd"] = angular
+                # The ramp is already finished by the time anyone touches a
+                # slider, so the command takes effect on the next step.
+                state.info["vel_tar"] = linear
+                state.info["ang_vel_tar"] = angular
 
             state, rng, plan, weights, returns = self._control(
                 state, rng, plan, temp, not fresh
@@ -299,6 +394,16 @@ class LiveDial:
 
             reward = float(state.reward)
             terms = np.asarray(state.info["reward_terms"])
+            ps = state.pipeline_state
+            torso = self.env._torso_idx - 1
+            body = {
+                "height": round(float(ps.x.pos[torso][2]), 3),
+                "speed": round(float(jnp.linalg.norm(ps.xd.vel[torso][:2])), 3),
+                "yaw_rate": round(float(ps.xd.ang[torso][2]), 3),
+                "torque_sq": round(float(jnp.sum(jnp.square(ps.ctrl))), 1),
+            }
+            if "n_contact" in state.info:
+                body["feet_down"] = round(float(state.info["n_contact"]), 2)
             episode_reward += reward
             episode_step += 1
             step_index += 1
@@ -337,6 +442,8 @@ class LiveDial:
                 control_hz=round(control_hz, 1),
                 realtime=round(control_hz * self.control_dt, 3),
                 seed=seed,
+                body=body,
+                command=[round(v, 2) for v in command] if self._has_command else None,
                 sample=report,
                 return_spread=round(float(np.asarray(returns).std()), 4),
             )
@@ -413,6 +520,22 @@ PAGE = """<!doctype html>
   </div>
  </div>
  <div>
+  <div class="card" id="cmdcard" style="display:none">
+   <h2>속도 명령</h2>
+   <div class="row"><label>vx</label>
+    <input type="range" id="cvx" min="-0.6" max="1.6" step="0.05"
+           oninput="cvxv.textContent=(+this.value).toFixed(2);sendCommand()">
+    <span class="num" id="cvxv">–</span></div>
+   <div class="row"><label>vy</label>
+    <input type="range" id="cvy" min="-0.6" max="0.6" step="0.05"
+           oninput="cvyv.textContent=(+this.value).toFixed(2);sendCommand()">
+    <span class="num" id="cvyv">–</span></div>
+   <div class="row"><label>vyaw</label>
+    <input type="range" id="cvyaw" min="-1.6" max="1.6" step="0.05"
+           oninput="cvyawv.textContent=(+this.value).toFixed(2);sendCommand()">
+    <span class="num" id="cvyawv">–</span></div>
+   <div class="hint">명령은 몸통 기준입니다. 외란은 world 기준으로 들어갑니다.</div>
+  </div>
   <div class="card">
    <h2>보상 가중치 ω</h2>
    <div id="omega"></div>
@@ -433,6 +556,7 @@ PAGE = """<!doctype html>
    <table><tbody id="samp"></tbody></table>
   </div>
   <div class="card"><h2>비용</h2><table><tbody id="cost"></tbody></table></div>
+  <div class="card"><h2>몸통</h2><table><tbody id="body"></tbody></table></div>
   <div class="card"><h2>실행</h2><table><tbody id="run"></tbody></table></div>
  </div>
 </main>
@@ -463,12 +587,19 @@ function sendOmega(){const v=S.row_names.map((_,i)=>+document.getElementById('w'
   post('/controls',{omega:v})}
 function applyTemp(log){const t=Math.pow(10,+log);tempv.textContent=t.toFixed(4);
   post('/controls',{temp:t})}
+function sendCommand(){post('/controls',{command:{vx:+cvx.value,vy:+cvy.value,
+  vyaw:+cvyaw.value}})}
+function initCommand(c){cmdcard.style.display='';
+  [['cvx',c[0]],['cvy',c[1]],['cvyaw',c[2]]].forEach(([id,v])=>{
+    document.getElementById(id).value=v;
+    document.getElementById(id+'v').textContent=(+v).toFixed(2)})}
 
 async function tick(){
   const s=await (await fetch('/stats')).json(); S=s;
   env.textContent=`${s.env} · ${s.n_sample} samples · ${s.n_diffuse} anneal levels`;
   if(s.status!=='running')return;
   if(!document.getElementById('w0')) buildOmega(s.row_names,s.omega);
+  if(s.command && cvxv.textContent==='–') initCommand(s.command);
   if(tempv.textContent==='–'){temp.value=Math.log10(s.temp);
     tempv.textContent=s.temp.toFixed(4)}
   secs.textContent=s.episode_seconds.toFixed(2);
@@ -488,6 +619,8 @@ async function tick(){
   rows(cost,[['현재 비용',s.cost],
     ...s.row_names.map((n,i)=>[n,`${s.terms[i]}  ×${s.omega[i]} = ${s.weighted_terms[i]}`]),
     ['ω 방향',s.omega_direction.join('  ')]]);
+  if(s.body) rows(document.getElementById('body'),
+    Object.entries(s.body).map(([k,v])=>[k,v]));
   rows(run,[['제어 Hz',s.control_hz],['실시간 배속',s.realtime],['시드',s.seed]]);
 }
 tick();setInterval(tick,400);
@@ -516,13 +649,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ndiffuse", type=int, default=None)
     parser.add_argument("--row-names", nargs="+", default=None,
                         help="labels for the reward rows, in order")
+    parser.add_argument("--bootstrap", type=int, default=None,
+                        help="control steps of gait-referenced bootstrap before "
+                             "handing over; defaults to 60 on the tasks whose "
+                             "objective names no gait, 0 elsewhere")
     return parser
 
 
 def main() -> None:
     args = _parser().parse_args()
-    if args.row_names is None and args.example == "unitree_go2_push_recover":
-        args.row_names = ["tilt", "base", "feet", "shape"]
+    if args.row_names is None:
+        args.row_names = ROW_NAMES.get(args.example)
+    if args.bootstrap is None:
+        args.bootstrap = 60 if args.example in BOOTSTRAP_ENVS else 0
     live = LiveDial(args)
 
     app = Flask("dial_live")
@@ -544,7 +683,8 @@ def main() -> None:
     @app.post("/controls")
     def controls():
         body = request.get_json(silent=True) or {}
-        live.set_controls(omega=body.get("omega"), temp=body.get("temp"))
+        live.set_controls(omega=body.get("omega"), temp=body.get("temp"),
+                          command=body.get("command"))
         return jsonify(ok=True, **live.controls)
 
     @app.post("/reset")

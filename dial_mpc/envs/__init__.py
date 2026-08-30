@@ -12,7 +12,10 @@ from dial_mpc.envs.unitree_go2_env import (
     UnitreeGo2GaitChoiceEnvConfig,
     UnitreeGo2WalkRecoverEnvConfig,
 )
-from dial_mpc.envs.manipulation import AllegroReorientEnvConfig
+from dial_mpc.envs.manipulation import (
+    AllegroReorientEnvConfig,
+    AllegroInHandEnvConfig,
+)
 
 _configs = {
     "unitree_h1_walk": UnitreeH1WalkEnvConfig,
@@ -25,6 +28,7 @@ _configs = {
     "unitree_go2_gait_choice": UnitreeGo2GaitChoiceEnvConfig,
     "unitree_go2_walk_recover": UnitreeGo2WalkRecoverEnvConfig,
     "allegro_reorient": AllegroReorientEnvConfig,
+    "allegro_in_hand": AllegroInHandEnvConfig,
 }
 
 

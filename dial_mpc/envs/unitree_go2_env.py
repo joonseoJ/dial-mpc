@@ -1459,6 +1459,16 @@ class UnitreeGo2WalkRecoverEnvConfig(UnitreeGo2GaitChoiceEnvConfig):
     push_linear_velocity: float = 0.6
     push_scale_min: float = 0.4
 
+    # Deadband for row 0, as a coefficient on the squared commanded speed.
+    # The nominal fore-aft foot sweep has amplitude v T / 2, so the squared
+    # departure a correct gait produces grows as v^2.  Without this the row
+    # opposes walking itself: measured at a 0.8 m/s command the robot settled
+    # at 0.25 m/s, and the two rows account for it exactly -- stepping reads
+    # -5.08 v^2 and velocity -2.32 (v - 0.8)^2, whose sum is stationary at
+    # v = 0.25.  Scaled by the *commanded* speed, never the realised one, so
+    # slowing down cannot shrink the robot's own deadband.
+    step_baseline_coeff: float = 0.0
+
     # Deadbands, in the raw units of rows 1 and 2.  Both rows measure an
     # absolute magnitude, and a robot that stops walking has less of either,
     # so without these the trunk row is minimised by standing still -- measured,
@@ -1574,6 +1584,12 @@ class UnitreeGo2WalkRecoverEnv(UnitreeGo2GaitChoiceEnv):
         offsets = (foot_xy - base_xy) @ yaw_rot
         step_dev = jnp.sum(
             jnp.square(offsets - self._nominal_foot_offset)
+        )
+        step_dev = jnp.maximum(
+            step_dev
+            - self._config.step_baseline_coeff
+            * jnp.sum(jnp.square(vel_tar[:2])),
+            0.0,
         )
         reward_step = -step_dev / self._config.step_scale
 
