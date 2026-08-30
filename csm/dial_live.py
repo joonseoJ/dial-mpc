@@ -76,7 +76,11 @@ ROW_NAMES = {
     "unitree_go2_push_recover": ["tilt", "base", "feet", "shape"],
     "unitree_go2_gait_choice": ["track", "energy", "payload", "contact"],
     "unitree_go2_walk_recover": ["stepping", "trunk", "effort", "velocity"],
+    "allegro_in_hand": ["progress", "security", "force", "posture"],
 }
+# Tasks whose scene has no tracking camera; the free camera is framed by the
+# model's own `statistic` and `global` settings.
+FREE_CAMERA_ENVS = ("allegro_in_hand", "allegro_reorient")
 # Tasks whose objective contains no gait reference.  Sampling MPC will not find
 # a gait from a standing plan on these -- standing is a local optimum and a
 # sampled step pays support, impulse and swing work before the horizon sees the
@@ -168,6 +172,7 @@ class LiveDial:
         # Only the locomotion tasks carry a velocity command; the stand-and-
         # resist task has no use for the sliders.
         self._has_command = hasattr(env_config, "command_vx_max")
+        self._has_goal_rate = hasattr(env_config, "goal_rate")
 
         @jax.jit
         def push(state, impulse):
@@ -181,7 +186,9 @@ class LiveDial:
         self._push = push
 
         self.control_dt = float(self.env.dt)
-        self.camera = args.camera or "track"
+        self.camera = args.camera or (
+            None if dial_config.env_name in FREE_CAMERA_ENVS else "track"
+        )
         self.render_every = max(
             1, int(round((1.0 / self.control_dt) / max(args.fps, 1e-6)))
         )
@@ -196,6 +203,7 @@ class LiveDial:
             "vx": float(getattr(env_config, "default_vx", 0.0)),
             "vy": float(getattr(env_config, "default_vy", 0.0)),
             "vyaw": float(getattr(env_config, "default_vyaw", 0.0)),
+            "goal_rate": float(getattr(env_config, "goal_rate", 0.0)),
         }
         self.stats: dict[str, object] = {
             "status": "starting",
@@ -296,7 +304,7 @@ class LiveDial:
             if temp is not None:
                 self.controls["temp"] = max(float(temp), 1e-4)
             if command is not None:
-                for key in ("vx", "vy", "vyaw"):
+                for key in ("vx", "vy", "vyaw", "goal_rate"):
                     if command.get(key) is not None:
                         self.controls[key] = float(command[key])
 
@@ -306,7 +314,8 @@ class LiveDial:
             omega = jnp.asarray(self.controls["omega"], dtype=jnp.float32)
             temp = jnp.asarray(self.controls["temp"], dtype=jnp.float32)
             command = (float(self.controls["vx"]), float(self.controls["vy"]),
-                       float(self.controls["vyaw"]))
+                       float(self.controls["vyaw"]),
+                       float(self.controls["goal_rate"]))
         return pending, omega, temp, command
 
     # ------------------------------------------------------------ diagnostics
@@ -375,8 +384,10 @@ class LiveDial:
             # The weights are read out of the state by the rollouts, so writing
             # them here is all it takes for a slider to reach the planner.
             state.info["reward_weights"] = omega
+            if self._has_goal_rate:
+                state.info["goal_rate"] = jnp.asarray(command[3], jnp.float32)
             if self._has_command:
-                vx, vy, vyaw = command
+                vx, vy, vyaw = command[:3]
                 linear = jnp.array([vx, vy, 0.0], dtype=jnp.float32)
                 angular = jnp.array([0.0, 0.0, vyaw], dtype=jnp.float32)
                 state.info["vel_cmd"] = linear
@@ -395,15 +406,27 @@ class LiveDial:
             reward = float(state.reward)
             terms = np.asarray(state.info["reward_terms"])
             ps = state.pipeline_state
-            torso = self.env._torso_idx - 1
-            body = {
-                "height": round(float(ps.x.pos[torso][2]), 3),
-                "speed": round(float(jnp.linalg.norm(ps.xd.vel[torso][:2])), 3),
-                "yaw_rate": round(float(ps.xd.ang[torso][2]), 3),
-                "torque_sq": round(float(jnp.sum(jnp.square(ps.ctrl))), 1),
-            }
-            if "n_contact" in state.info:
-                body["feet_down"] = round(float(state.info["n_contact"]), 2)
+            if hasattr(self.env, "_object_body_idx"):
+                index = self.env._object_body_idx - 1
+                body = {
+                    "spin": round(float(jnp.dot(ps.xd.ang[index],
+                                                state.info["goal_axis"])), 3),
+                    "angle_err": round(float(state.info["angle_error"]), 4),
+                    "fingers_on": round(float(state.info["n_contact"]), 2),
+                    "squeeze": f"{float(state.info['squeeze']):.2e}",
+                    "drift": round(float(jnp.linalg.norm(
+                        ps.x.pos[index] - self.env._nominal_object)), 4),
+                }
+            else:
+                torso = self.env._torso_idx - 1
+                body = {
+                    "height": round(float(ps.x.pos[torso][2]), 3),
+                    "speed": round(float(jnp.linalg.norm(ps.xd.vel[torso][:2])), 3),
+                    "yaw_rate": round(float(ps.xd.ang[torso][2]), 3),
+                    "torque_sq": round(float(jnp.sum(jnp.square(ps.ctrl))), 1),
+                }
+                if "n_contact" in state.info:
+                    body["feet_down"] = round(float(state.info["n_contact"]), 2)
             episode_reward += reward
             episode_step += 1
             step_index += 1
@@ -443,7 +466,9 @@ class LiveDial:
                 realtime=round(control_hz * self.control_dt, 3),
                 seed=seed,
                 body=body,
-                command=[round(v, 2) for v in command] if self._has_command else None,
+                command=([round(v, 2) for v in command[:3]]
+                         if self._has_command else None),
+                goal_rate=round(command[3], 2) if self._has_goal_rate else None,
                 sample=report,
                 return_spread=round(float(np.asarray(returns).std()), 4),
             )
@@ -520,6 +545,15 @@ PAGE = """<!doctype html>
   </div>
  </div>
  <div>
+  <div class="card" id="ratecard" style="display:none">
+   <h2>목표 회전 속도</h2>
+   <div class="row"><label>rad/s</label>
+    <input type="range" id="grate" min="0" max="2.5" step="0.05"
+           oninput="gratev.textContent=(+this.value).toFixed(2);sendCommand()">
+    <span class="num" id="gratev">–</span></div>
+   <div class="hint">물체가 따라가야 할 자세가 이 속도로 계속 돌아갑니다.
+    올릴수록 마찰원뿔 제약이 조여서 진척과 파지가 세게 충돌합니다.</div>
+  </div>
   <div class="card" id="cmdcard" style="display:none">
    <h2>속도 명령</h2>
    <div class="row"><label>vx</label>
@@ -587,8 +621,10 @@ function sendOmega(){const v=S.row_names.map((_,i)=>+document.getElementById('w'
   post('/controls',{omega:v})}
 function applyTemp(log){const t=Math.pow(10,+log);tempv.textContent=t.toFixed(4);
   post('/controls',{temp:t})}
-function sendCommand(){post('/controls',{command:{vx:+cvx.value,vy:+cvy.value,
-  vyaw:+cvyaw.value}})}
+function sendCommand(){const c={};
+  if(S.command){c.vx=+cvx.value;c.vy=+cvy.value;c.vyaw=+cvyaw.value}
+  if(S.goal_rate!==null&&S.goal_rate!==undefined)c.goal_rate=+grate.value;
+  post('/controls',{command:c})}
 function initCommand(c){cmdcard.style.display='';
   [['cvx',c[0]],['cvy',c[1]],['cvyaw',c[2]]].forEach(([id,v])=>{
     document.getElementById(id).value=v;
@@ -600,6 +636,9 @@ async function tick(){
   if(s.status!=='running')return;
   if(!document.getElementById('w0')) buildOmega(s.row_names,s.omega);
   if(s.command && cvxv.textContent==='–') initCommand(s.command);
+  if(s.goal_rate!==null&&s.goal_rate!==undefined&&gratev.textContent==='–'){
+    ratecard.style.display='';grate.value=s.goal_rate;
+    gratev.textContent=(+s.goal_rate).toFixed(2)}
   if(tempv.textContent==='–'){temp.value=Math.log10(s.temp);
     tempv.textContent=s.temp.toFixed(4)}
   secs.textContent=s.episode_seconds.toFixed(2);

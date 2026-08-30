@@ -294,7 +294,10 @@ class AllegroInHandEnv(BaseEnv):
         return axis / jnp.maximum(jnp.linalg.norm(axis), 1e-9)
 
     def _goal_quat(self, state_info, base: jax.Array) -> jax.Array:
-        angle = self._config.goal_rate * state_info["step"] * self.dt
+        # The rate lives in `info` rather than in the config so a viewer can
+        # turn it while the hand is running: how fast the object is wanted is a
+        # task knob, exactly like the weights are.
+        angle = state_info["goal_rate"] * state_info["step"] * self.dt
         return math.quat_mul(
             math.quat_rot_axis(state_info["goal_axis"], angle), base
         )
@@ -367,6 +370,7 @@ class AllegroInHandEnv(BaseEnv):
         state_info = {
             "rng": rng,
             "goal_axis": self._goal_axis(goal_rng),
+            "goal_rate": jnp.asarray(self._config.goal_rate, dtype=jnp.float32),
             "goal_base": base,
             "step": 0,
             "reward_weights": normalize_omega(
