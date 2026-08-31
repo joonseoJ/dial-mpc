@@ -1,4 +1,4 @@
-"""Screen the gait-choice basis: does omega change how the robot walks?
+"""Screen a reward basis, and measure what the weight does to the gait.
 
 Two measurements, kept separate on purpose.
 
@@ -7,13 +7,20 @@ shared control weights, one proposal cloud is drawn at the final annealing
 level, and every omega re-weights that same cloud.  Because the samples are
 shared, comparing omegas measures the objective and not the difficulty of the
 states each omega happened to visit -- the confound that made the walking
-task's closed-loop numbers unreadable.
+task's first closed-loop numbers unreadable.  It also reports each row's spread
+across the cloud, which is what the row normalizers have to equalise: a row
+whose weight cannot move the argmax is not part of the basis however large you
+make it.
 
 `walk` is the physical evidence.  Each omega drives a full DIAL loop against a
 velocity command and the resulting gait is measured directly: duty factor,
-cadence, stride, torso bounce, cost of transport, touchdown speed.  Cost
-scores can differ for uninteresting reasons; these cannot.  If the gait
-statistics do not separate, the basis does not work, whatever the scores say.
+cadence, stride, torso bounce, cost of transport, touchdown speed.  Cost scores
+can differ for uninteresting reasons; these cannot.  If the gait statistics do
+not separate, the basis does not work, whatever the scores say.
+
+Nothing here is task-specific: the row count comes from the environment's
+weight vector and the per-step diagnostics are read defensively, so the same
+screen runs on any basis registered in `dial_mpc.envs`.
 """
 
 from __future__ import annotations
@@ -33,10 +40,18 @@ import dial_mpc.envs as dial_envs  # noqa: F401  (registers the environments)
 from dial_mpc.core.dial_core import make_controller
 
 from csm.basis_screen import _load_config, build_omegas
-from csm.dial_lean import make_dial_step, make_lean_update, make_rollout
+from csm.dial_lean import (
+    make_dial_step, make_lean_update, make_rollout, mppi_weights,
+)
 from csm.omega import normalize_omega_np
 
-ROWS = ["track", "energy", "payload", "contact"]
+# Row labels per task; the count itself comes from the environment's weight
+# vector so the screen runs on any basis.
+ROW_NAMES = {
+    "unitree_go2_walk": ["tracking", "stability", "gait"],
+    "unitree_go2_push_recover": ["tilt", "base", "feet", "shape"],
+}
+ROWS: list[str] = []
 GRAVITY = 9.81
 
 # The joystick the one field has to cover: straight, turning, strafing,
@@ -148,7 +163,9 @@ def make_closed_loop(env, mbdpi, dial_config, n_steps, std_normalize):
             "foot_z": foot_z,
             "contact": (foot_z < 1e-3).astype(jnp.float32),
             "terms": state.info["reward_terms"],
-            "power": state.info["power"],
+            # Mechanical power is published by some environments and not
+            # others; the screen should not require it.
+            "power": state.info.get("power", jnp.zeros(())),
             "done": state.done,
             "vel_tar": state.info["vel_tar"],
             "ang_vel_tar": state.info["ang_vel_tar"],
@@ -285,12 +302,11 @@ def analyse_cloud(terms, omega_mat, temp, elite_frac, std_normalize):
     """One cloud, every omega.  Same samples, so the exam is identical."""
 
     returns = terms @ omega_mat.T                       # (n_sample, n_omega)
-    ref = returns[-1]
-    scale = returns.std(axis=0) if std_normalize else np.ones(returns.shape[1])
-    logits = (returns - ref) / np.maximum(scale, 1e-6) / temp
-    logits -= logits.max(axis=0, keepdims=True)
-    w = np.exp(logits)
-    w /= w.sum(axis=0, keepdims=True)                   # (n_sample, n_omega)
+    # Same softmax the planner runs, not a re-derivation of it: a screen that
+    # scored the cloud by a slightly different rule would not be measuring the
+    # controller it is meant to describe.
+    w = np.asarray(mppi_weights(jnp.asarray(returns), temp, std_normalize,
+                                axis=0))
 
     ess = 1.0 / np.sum(w**2, axis=0)
     # What omega i's update actually achieves on every row.
@@ -314,7 +330,7 @@ def analyse_cloud(terms, omega_mat, temp, elite_frac, std_normalize):
 # --------------------------------------------------------------------- #
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--example", default="unitree_go2_gait_choice")
+    parser.add_argument("--example", default="unitree_go2_trot_csm")
     parser.add_argument("--mode", default="both",
                         choices=["cloud", "walk", "both"])
     parser.add_argument("--steps", type=int, default=200)
@@ -362,10 +378,14 @@ def main() -> None:
     mass = float(jnp.sum(env.sys.mj_model.body_mass))
     reset = jax.jit(env.reset)
 
-    catalogue = build_omegas(4)
+    n_rows = int(np.asarray(env_config.reward_weights).shape[0])
+    rows = ROW_NAMES.get(dial_config.env_name,
+                         [f"row{i}" for i in range(n_rows)])[:n_rows]
+    globals()["ROWS"] = rows
+    catalogue = build_omegas(n_rows)
     if args.weights is None:
-        names = ["uniform"] + [f"boost{i}" for i in range(4)] + \
-                [f"e{i}" for i in range(4)]
+        names = ["uniform"] + [f"boost{i}" for i in range(n_rows)] + \
+                [f"e{i}" for i in range(n_rows)]
         omegas = {n: catalogue[n] for n in names}
     elif ";" in args.weights or "," in args.weights and args.weights[0].isdigit():
         omegas = {}
@@ -381,7 +401,7 @@ def main() -> None:
                                                    for n in names},
               "std_normalize": std_normalize,
               "temp": float(dial_config.temp_sample),
-              "rows": ROWS}
+              "rows": rows}
 
     print(f"env {dial_config.env_name}  mass {mass:.2f} kg  "
           f"Hsample {dial_config.Hsample} ({dial_config.Hsample*env.dt:.2f} s)  "
@@ -431,10 +451,14 @@ def main() -> None:
         row_std = np.mean([t.std(axis=0) for t in all_terms], axis=0)
 
         print("\n=== row scale calibration (std across the cloud) ===")
-        print(f"{'row':<10}{'std':>10}{'x to equalise':>16}")
-        target = float(np.mean(row_std))
-        for i, r in enumerate(ROWS):
-            print(f"{r:<10}{row_std[i]:10.3f}{target/max(row_std[i],1e-9):16.3f}")
+        print(f"{'row':<10}{'std':>12}{'x to equalise':>16}")
+        multiplier = float(np.mean(row_std)) / np.maximum(row_std, 1e-12)
+        # Equalise at constant total magnitude: raising the weak rows alone is
+        # what put the walking robot on the ground in an earlier pass.
+        multiplier = multiplier / float(np.exp(np.mean(np.log(multiplier))))
+        for i, r in enumerate(rows):
+            print(f"{r:<10}{row_std[i]:12.4g}{multiplier[i]:16.3f}")
+        print(f"  spread max/min: {row_std.max()/max(row_std.min(),1e-12):.1f}x")
 
         print("\n=== cross-evaluation on the shared cloud "
               "(row: whose update, column: who marks) ===")

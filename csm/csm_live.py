@@ -48,7 +48,7 @@ from csm.basis_screen import _load_config, build_omegas
 from csm.dial_lean import make_dial_step
 from csm.dial_score import ComposedDialScorePolicy, factor_to_t
 from csm.dial_score_serve import FrameRenderer, _label
-from csm.omega import normalize_omega, normalize_omega_np
+from csm.omega import mixture_from_pinv, normalize_omega, normalize_omega_np
 
 from PIL import Image
 
@@ -67,25 +67,10 @@ def make_student_step(env, policy, dial_config, init_passes: int):
     factor_min, factor_max = float(jnp.min(factors)), float(jnp.max(factors))
     shift = jnp.asarray(fields[0].shift_matrix)
     pinv_nu = getattr(policy, "pinv_nu_weights", None)
+    pinv_mode = policy.pinv_mode_weights
 
-    if pinv_nu is None:
-        # Policies fitted before temperatures were recorded solved for the
-        # mixture in omega rather than in nu, with the coefficients renormalised
-        # to sum to one -- the spread normalisation had already destroyed the
-        # magnitude, so there was nothing else to pin it to.  `coefficients` on
-        # the policy carries the same fallback; it is repeated here because this
-        # path has to be traceable.
-        pinv_mode = jnp.asarray(policy.pinv_mode_weights)
-
-        def coefficients(omega, temperature):
-            raw = jnp.asarray(omega, dtype=jnp.float32) @ pinv_mode
-            total = jnp.sum(raw)
-            return jnp.where(jnp.abs(total) > 1e-6, raw / total, raw)
-    else:
-        pinv_nu = jnp.asarray(pinv_nu)
-
-        def coefficients(omega, temperature):
-            return (normalize_omega(omega) / temperature) @ pinv_nu
+    def coefficients(omega, temperature):
+        return mixture_from_pinv(omega, temperature, pinv_nu, pinv_mode)
 
     def refine(plan, obs, mixture, passes):
         def level(carry, factor):
@@ -577,8 +562,6 @@ def main() -> None:
     names = {
         "unitree_go2_push_recover": ["tilt", "base", "feet", "shape"],
         "unitree_go2_trot": ["tracking", "stability", "gait"],
-        "unitree_go2_walk_recover": ["stepping", "trunk", "effort", "velocity"],
-        "allegro_in_hand": ["progress", "security", "force", "posture"],
     }
     if args.row_names is None:
         key = args.example or (str(args.config) if args.config else "")

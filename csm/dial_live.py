@@ -74,19 +74,11 @@ MASS_RANKS = (1, 4, 16, 64, 256, 1024)
 # than "row0..row3".
 ROW_NAMES = {
     "unitree_go2_push_recover": ["tilt", "base", "feet", "shape"],
-    "unitree_go2_gait_choice": ["track", "energy", "payload", "contact"],
-    "unitree_go2_walk_recover": ["stepping", "trunk", "effort", "velocity"],
-    "allegro_in_hand": ["progress", "security", "force", "posture"],
+    "unitree_go2_walk": ["tracking", "stability", "gait"],
 }
 # Tasks whose scene has no tracking camera; the free camera is framed by the
 # model's own `statistic` and `global` settings.
-FREE_CAMERA_ENVS = ("allegro_in_hand", "allegro_reorient")
-# Tasks whose objective contains no gait reference.  Sampling MPC will not find
-# a gait from a standing plan on these -- standing is a local optimum and a
-# sampled step pays support, impulse and swing work before the horizon sees the
-# progress it buys -- so the viewer opens with a bootstrap instance that carries
-# a foot-height term, and hands its state and plan to the measured one.
-BOOTSTRAP_ENVS = ("unitree_go2_gait_choice", "unitree_go2_walk_recover")
+FREE_CAMERA_ENVS = ("allegro_reorient",)
 
 
 def _load(example: str | None, config_path: Path | None):
@@ -166,13 +158,9 @@ class LiveDial:
 
         self._reset_env = jax.jit(self.env.reset)
         self._control = make_interactive_step(self.env, self.mbdpi, self.dial_config)
-        self._boot = None
-        if int(args.bootstrap) > 0:
-            self._build_bootstrap(env_config)
         # Only the locomotion tasks carry a velocity command; the stand-and-
         # resist task has no use for the sliders.
         self._has_command = hasattr(env_config, "command_vx_max")
-        self._has_goal_rate = hasattr(env_config, "goal_rate")
 
         @jax.jit
         def push(state, impulse):
@@ -203,7 +191,6 @@ class LiveDial:
             "vx": float(getattr(env_config, "default_vx", 0.0)),
             "vy": float(getattr(env_config, "default_vy", 0.0)),
             "vyaw": float(getattr(env_config, "default_vyaw", 0.0)),
-            "goal_rate": float(getattr(env_config, "goal_rate", 0.0)),
         }
         self.stats: dict[str, object] = {
             "status": "starting",
@@ -214,64 +201,15 @@ class LiveDial:
             "mass_ranks": list(MASS_RANKS),
         }
 
-    def _build_bootstrap(self, env_config) -> None:
-        """A second instance of the same physics whose reward names a gait.
-
-        Its foot-height term never enters the objective the sliders drive; it
-        exists only to put the planner in a trotting basin, and the state and
-        plan it produces are what every weight starts from.
-        """
-
-        from csm.dial_lean import make_dial_step
-        from csm.gait_choice_eval import make_warm_start
-
-        boot_config = dataclasses.replace(
-            env_config,
-            gait="trot",
-            bootstrap_gait_weight=max(
-                float(getattr(env_config, "bootstrap_gait_weight", 0.0)), 1.0
-            ),
-        )
-        boot_env = brax_envs.get_environment(
-            self.dial_config.env_name, config=boot_config
-        )
-        warm = make_warm_start(boot_env, self.mbdpi, self.dial_config, True)
-        control = make_dial_step(boot_env, self.mbdpi, self.dial_config,
-                                 std_normalize=True)
-        length = int(self.args.bootstrap)
-
-        @jax.jit
-        def boot(state, rng):
-            rng, plan = warm(state, rng)
-
-            def body(carry, _):
-                st, key, pl = carry
-                st, key, pl = control(st, key, pl)
-                return (st, key, pl), None
-
-            (state, rng, plan), _ = jax.lax.scan(
-                body, (state, rng, plan), None, length=length
-            )
-            return state, plan
-
-        self._boot_reset = jax.jit(boot_env.reset)
-        self._boot = boot
-
     def _start(self, seed: int):
-        """Fresh episode: bootstrapped into a trot where the task needs it."""
+        """Fresh episode from a zero plan."""
 
-        if self._boot is None:
-            state = self._reset_env(jax.random.PRNGKey(seed))
-            plan = jnp.zeros(
-                (self.dial_config.Hnode + 1, int(self.env.action_size)),
-                dtype=jnp.float32,
-            )
-            return state, plan, True
-        state = self._boot_reset(jax.random.PRNGKey(seed))
-        state, plan = self._boot(state, jax.random.PRNGKey(seed + 31))
-        # The plan is already annealed and the robot is already walking, so the
-        # first control step must shift rather than restart.
-        return state, plan, False
+        state = self._reset_env(jax.random.PRNGKey(seed))
+        plan = jnp.zeros(
+            (self.dial_config.Hnode + 1, int(self.env.action_size)),
+            dtype=jnp.float32,
+        )
+        return state, plan, True
 
     # ---------------------------------------------------------------- frames
     def publish(self, pixels, caption: str) -> None:
@@ -304,7 +242,7 @@ class LiveDial:
             if temp is not None:
                 self.controls["temp"] = max(float(temp), 1e-4)
             if command is not None:
-                for key in ("vx", "vy", "vyaw", "goal_rate"):
+                for key in ("vx", "vy", "vyaw"):
                     if command.get(key) is not None:
                         self.controls[key] = float(command[key])
 
@@ -314,8 +252,7 @@ class LiveDial:
             omega = jnp.asarray(self.controls["omega"], dtype=jnp.float32)
             temp = jnp.asarray(self.controls["temp"], dtype=jnp.float32)
             command = (float(self.controls["vx"]), float(self.controls["vy"]),
-                       float(self.controls["vyaw"]),
-                       float(self.controls["goal_rate"]))
+                       float(self.controls["vyaw"]))
         return pending, omega, temp, command
 
     # ------------------------------------------------------------ diagnostics
@@ -384,10 +321,8 @@ class LiveDial:
             # The weights are read out of the state by the rollouts, so writing
             # them here is all it takes for a slider to reach the planner.
             state.info["reward_weights"] = omega
-            if self._has_goal_rate:
-                state.info["goal_rate"] = jnp.asarray(command[3], jnp.float32)
             if self._has_command:
-                vx, vy, vyaw = command[:3]
+                vx, vy, vyaw = command
                 linear = jnp.array([vx, vy, 0.0], dtype=jnp.float32)
                 angular = jnp.array([0.0, 0.0, vyaw], dtype=jnp.float32)
                 state.info["vel_cmd"] = linear
@@ -406,42 +341,15 @@ class LiveDial:
             reward = float(state.reward)
             terms = np.asarray(state.info["reward_terms"])
             ps = state.pipeline_state
-            if hasattr(self.env, "_object_body_idx"):
-                index = self.env._object_body_idx - 1
-                body = {
-                    "spin": round(float(jnp.dot(ps.xd.ang[index],
-                                                state.info["goal_axis"])), 3),
-                    "angle_err": round(float(state.info["angle_error"]), 4),
-                    "fingers_on": round(float(state.info["n_contact"]), 2),
-                    "squeeze": f"{float(state.info['squeeze']):.2e}",
-                    "drift": round(float(jnp.linalg.norm(
-                        ps.x.pos[index] - self.env._nominal_object)), 4),
-                }
-            else:
-                torso = self.env._torso_idx - 1
-                body = {
-                    "height": round(float(ps.x.pos[torso][2]), 3),
-                    "speed": round(float(jnp.linalg.norm(ps.xd.vel[torso][:2])), 3),
-                    "yaw_rate": round(float(ps.xd.ang[torso][2]), 3),
-                    "torque_sq": round(float(jnp.sum(jnp.square(ps.ctrl))), 1),
-                }
-                if "n_contact" in state.info:
-                    body["feet_down"] = round(float(state.info["n_contact"]), 2)
-            episode_reward += reward
-            episode_step += 1
-            step_index += 1
-            rate_steps += 1
-
-            if step_index % self.render_every == 0:
-                self.publish(
-                    renderer.render(state.pipeline_state),
-                    f"t={episode_step * self.control_dt:6.2f}s  cost={-reward:8.3f}",
-                )
-
-            now = time.perf_counter()
-            if now - rate_window >= 1.0:
-                control_hz = rate_steps / (now - rate_window)
-                rate_window, rate_steps = now, 0
+            torso = self.env._torso_idx - 1
+            body = {
+                "height": round(float(ps.x.pos[torso][2]), 3),
+                "speed": round(float(jnp.linalg.norm(ps.xd.vel[torso][:2])), 3),
+                "yaw_rate": round(float(ps.xd.ang[torso][2]), 3),
+                "torque_sq": round(float(jnp.sum(jnp.square(ps.ctrl))), 1),
+            }
+            if "n_contact" in state.info:
+                body["feet_down"] = round(float(state.info["n_contact"]), 2)
 
             omega_np = np.asarray(omega, dtype=float)
             total = float(np.abs(omega_np).sum()) or 1.0
@@ -468,7 +376,6 @@ class LiveDial:
                 body=body,
                 command=([round(v, 2) for v in command[:3]]
                          if self._has_command else None),
-                goal_rate=round(command[3], 2) if self._has_goal_rate else None,
                 sample=report,
                 return_spread=round(float(np.asarray(returns).std()), 4),
             )
@@ -545,15 +452,6 @@ PAGE = """<!doctype html>
   </div>
  </div>
  <div>
-  <div class="card" id="ratecard" style="display:none">
-   <h2>목표 회전 속도</h2>
-   <div class="row"><label>rad/s</label>
-    <input type="range" id="grate" min="0" max="2.5" step="0.05"
-           oninput="gratev.textContent=(+this.value).toFixed(2);sendCommand()">
-    <span class="num" id="gratev">–</span></div>
-   <div class="hint">물체가 따라가야 할 자세가 이 속도로 계속 돌아갑니다.
-    올릴수록 마찰원뿔 제약이 조여서 진척과 파지가 세게 충돌합니다.</div>
-  </div>
   <div class="card" id="cmdcard" style="display:none">
    <h2>속도 명령</h2>
    <div class="row"><label>vx</label>
@@ -621,10 +519,8 @@ function sendOmega(){const v=S.row_names.map((_,i)=>+document.getElementById('w'
   post('/controls',{omega:v})}
 function applyTemp(log){const t=Math.pow(10,+log);tempv.textContent=t.toFixed(4);
   post('/controls',{temp:t})}
-function sendCommand(){const c={};
-  if(S.command){c.vx=+cvx.value;c.vy=+cvy.value;c.vyaw=+cvyaw.value}
-  if(S.goal_rate!==null&&S.goal_rate!==undefined)c.goal_rate=+grate.value;
-  post('/controls',{command:c})}
+function sendCommand(){post('/controls',{command:{vx:+cvx.value,vy:+cvy.value,
+  vyaw:+cvyaw.value}})}
 function initCommand(c){cmdcard.style.display='';
   [['cvx',c[0]],['cvy',c[1]],['cvyaw',c[2]]].forEach(([id,v])=>{
     document.getElementById(id).value=v;
@@ -636,9 +532,6 @@ async function tick(){
   if(s.status!=='running')return;
   if(!document.getElementById('w0')) buildOmega(s.row_names,s.omega);
   if(s.command && cvxv.textContent==='–') initCommand(s.command);
-  if(s.goal_rate!==null&&s.goal_rate!==undefined&&gratev.textContent==='–'){
-    ratecard.style.display='';grate.value=s.goal_rate;
-    gratev.textContent=(+s.goal_rate).toFixed(2)}
   if(tempv.textContent==='–'){temp.value=Math.log10(s.temp);
     tempv.textContent=s.temp.toFixed(4)}
   secs.textContent=s.episode_seconds.toFixed(2);
@@ -688,10 +581,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ndiffuse", type=int, default=None)
     parser.add_argument("--row-names", nargs="+", default=None,
                         help="labels for the reward rows, in order")
-    parser.add_argument("--bootstrap", type=int, default=None,
-                        help="control steps of gait-referenced bootstrap before "
-                             "handing over; defaults to 60 on the tasks whose "
-                             "objective names no gait, 0 elsewhere")
     return parser
 
 
@@ -699,8 +588,6 @@ def main() -> None:
     args = _parser().parse_args()
     if args.row_names is None:
         args.row_names = ROW_NAMES.get(args.example)
-    if args.bootstrap is None:
-        args.bootstrap = 60 if args.example in BOOTSTRAP_ENVS else 0
     live = LiveDial(args)
 
     app = Flask("dial_live")
