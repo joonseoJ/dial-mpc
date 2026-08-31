@@ -45,6 +45,26 @@ from csm.dial_score import (
 from csm.omega import normalize_omega_np, nu_matrix
 
 
+def _repeats_used(args, paths) -> int:
+    """How many independent rollouts stand behind each stored query.
+
+    Only reached when `--repeats` is left off, which is why it went unnoticed:
+    `or` short-circuits, so every earlier fit passed the flag and never
+    evaluated the fallback.  The collection records the number it used, and the
+    stored returns carry it in their repeat axis if the record is missing.
+    """
+
+    if args.repeats:
+        return int(args.repeats)
+    for cloud in args.clouds:
+        meta = Path(cloud) / "collection.json"
+        if meta.exists():
+            recorded = json.loads(meta.read_text()).get("repeats")
+            if recorded:
+                return int(recorded)
+    return int(np.load(paths[0])["terms"].shape[1])
+
+
 def shard_paths(folders, limit: int | None = None) -> list[str]:
     """Every shard across every round, base first.
 
@@ -277,7 +297,7 @@ def main() -> None:
         "basis": args.basis,
         "temperature": args.temperature,
         "level_scales": args.level_scales,
-        "repeats_used": args.repeats or clouds.repeats,
+        "repeats_used": _repeats_used(args, paths),
         "labels": label_stats,
         "fits": {name: histories[row] for row, name in enumerate(args.basis)},
         "reduction": check,
