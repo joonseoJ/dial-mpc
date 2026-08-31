@@ -63,7 +63,7 @@ def make_rollout(env, per_step: Callable | None = None):
     return rollout
 
 
-def mppi_logits(returns, temp, std_normalize: bool = True):
+def mppi_logits(returns, temp, std_normalize: bool = True, axis: int = -1):
     """DIAL's softmax exponent, with its scale normalisation optional.
 
     With `std_normalize` on this is `reverse_once` verbatim.  Off, the exponent
@@ -71,11 +71,39 @@ def mppi_logits(returns, temp, std_normalize: bool = True):
     a known temperature -- which is what makes the score linear in the weights
     and the composition exact.  The price is that the temperature no longer
     adapts to the spread of the cloud on its own.
+
+    Every caller in the package goes through here.  The exponent *is* the
+    objective -- which samples the update is built from, what an effective
+    sample size measures, what a screen's cross-evaluation compares -- so a
+    second copy of it that drifted by a reference or a clamp would silently
+    mean two tasks were not being run under the same rule.  `axis` selects the
+    sample axis; the reference is the last entry along it, which is the
+    proposal centre DIAL scores against.
     """
 
-    reference = returns[-1]
-    scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
+    reference = jnp.expand_dims(jnp.take(returns, -1, axis=axis), axis)
+    scale = (
+        jnp.maximum(jnp.std(returns, axis=axis, keepdims=True), 1e-6)
+        if std_normalize
+        else 1.0
+    )
     return (returns - reference) / scale / temp
+
+
+def mppi_weights(returns, temp, std_normalize: bool = True, axis: int = -1):
+    """The softmax itself: DIAL's update weights over the sample cloud."""
+
+    return jax.nn.softmax(
+        mppi_logits(returns, temp, std_normalize, axis), axis=axis
+    )
+
+
+def effective_sample_size(returns, temp, std_normalize: bool = True,
+                          axis: int = -1):
+    """1 / sum(w^2): how many samples the update is actually built from."""
+
+    weights = mppi_weights(returns, temp, std_normalize, axis)
+    return 1.0 / jnp.sum(jnp.square(weights), axis=axis)
 
 
 def make_lean_update(env, mbdpi, dial_config, std_normalize: bool = True):
@@ -96,7 +124,7 @@ def make_lean_update(env, mbdpi, dial_config, std_normalize: bool = True):
         nodes = sample(sample_rng, plan, noise_scale)
         us = mbdpi.node2u_vvmap(nodes)
         returns = rollout_vmap(state, us).mean(axis=-1)
-        weights = jax.nn.softmax(mppi_logits(returns, temp, std_normalize))
+        weights = mppi_weights(returns, temp, std_normalize)
         return rng, jnp.einsum("n,nij->ij", weights, nodes)
 
     return update

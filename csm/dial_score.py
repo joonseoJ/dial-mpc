@@ -84,7 +84,7 @@ from tqdm.auto import tqdm
 
 from csm.architectures import MLP
 
-from csm.omega import normalize_omega
+from csm.omega import mixture_from_pinv, normalize_omega
 
 
 # --------------------------------------------------------------------------- #
@@ -1592,22 +1592,12 @@ class ComposedDialScorePolicy:
         already destroyed the magnitude.
         """
 
-        omega = jnp.asarray(omega, dtype=jnp.float32)
-        if getattr(self, "pinv_nu_weights", None) is None:
-            coefficients = omega @ self.pinv_mode_weights
-            total = jnp.sum(coefficients)
-            # A zero sum means omega is orthogonal to the basis span; leave the
-            # raw coefficients rather than dividing by ~0 and returning garbage.
-            return jnp.where(
-                jnp.abs(total) > 1e-6, coefficients / total, coefficients
-            )
-
+        pinv_nu = getattr(self, "pinv_nu_weights", None)
         temperature = (
             self.temperature if target_temperature is None else target_temperature
         )
-        direction = normalize_omega(omega)
-        return (direction / jnp.asarray(temperature, dtype=jnp.float32)) @ (
-            self.pinv_nu_weights
+        return mixture_from_pinv(
+            omega, temperature, pinv_nu, self.pinv_mode_weights
         )
 
     def shift(self, plan: jax.Array) -> jax.Array:

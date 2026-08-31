@@ -38,18 +38,16 @@ import brax.envs as brax_envs
 from dial_mpc.core.dial_core import make_controller
 
 from csm.basis_screen import _load_config, build_omegas
-from csm.dial_lean import make_rollout, make_sampler
+from csm.dial_lean import (
+    make_rollout, make_sampler,
+    effective_sample_size as _effective_sample_size,
+    mppi_weights,
+)
 from csm.push_recover_eval import make_push_reset
 
 
-def effective_sample_size(
-    returns: jnp.ndarray, temp: jnp.ndarray, std_normalize: bool = True
-) -> jnp.ndarray:
-    """DIAL's own weighting, then 1 / sum(w^2)."""
-
-    scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
-    weights = jax.nn.softmax((returns - returns[-1]) / scale / temp)
-    return 1.0 / jnp.sum(weights**2)
+# DIAL's own weighting, then 1 / sum(w^2); the softmax lives in dial_lean.
+effective_sample_size = _effective_sample_size
 
 
 def make_probe_step(env, mbdpi, dial_config, eval_temps, std_normalize=True):
@@ -62,8 +60,7 @@ def make_probe_step(env, mbdpi, dial_config, eval_temps, std_normalize=True):
         rng, key = jax.random.split(rng)
         nodes = sample(key, plan, noise_scale)
         returns = rollout_vmap(state, mbdpi.node2u_vvmap(nodes)).mean(axis=-1)
-        scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
-        weights = jax.nn.softmax((returns - returns[-1]) / scale / temp)
+        weights = mppi_weights(returns, temp, std_normalize)
         return rng, jnp.einsum("n,nij->ij", weights, nodes), returns
 
     def step(state, rng, plan, temp, shift):

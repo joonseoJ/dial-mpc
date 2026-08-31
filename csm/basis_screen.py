@@ -47,7 +47,10 @@ from dial_mpc.core.dial_config import DialConfig
 from dial_mpc.core.dial_core import make_controller
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 
-from csm.dial_lean import make_dial_step, make_rollout, make_sampler
+from csm.dial_lean import (
+    make_dial_step, make_rollout, make_sampler,
+    mppi_weights as _mppi_weights,
+)
 from csm.omega import normalize_omega_np
 
 
@@ -143,13 +146,8 @@ def make_pipeline(env, mbdpi, dial_config, warmup_steps: int,
     return pipeline, float(jnp.mean(final_noise))
 
 
-def mppi_weights(returns: jnp.ndarray, temp: float,
-                 std_normalize: bool = True) -> jnp.ndarray:
-    """DIAL's softmax update weights for one omega's sample returns."""
-
-    reference = returns[-1]
-    scale = jnp.maximum(returns.std(), 1e-6) if std_normalize else 1.0
-    return jax.nn.softmax((returns - reference) / scale / temp)
+# The softmax lives in one place; see `csm.dial_lean.mppi_logits`.
+mppi_weights = _mppi_weights
 
 
 def analyse_state(terms, Y0s, lifted, done, omega_mat, temp, elite_frac,

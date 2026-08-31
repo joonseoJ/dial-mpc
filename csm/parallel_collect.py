@@ -39,9 +39,9 @@ import jax.numpy as jnp
 from pathlib import Path
 
 from csm.cloud_data import DialCloudData, save_clouds
-from csm.dial_lean import make_rollout, make_sampler
+from csm.dial_lean import make_rollout, make_sampler, mppi_weights
 from csm.dial_score import factor_to_t
-from csm.omega import normalize_omega
+from csm.omega import mixture_from_pinv, normalize_omega
 
 
 def make_pass(
@@ -111,11 +111,7 @@ def make_pass(
         # The drive update is the base query's label under this environment's
         # own weight vector, averaged over repeats exactly as the teacher does.
         returns = terms[0] @ omega              # (R, N)
-        scale = (jnp.maximum(returns.std(axis=-1, keepdims=True), 1e-6)
-                 if std_normalize else 1.0)
-        weights = jax.nn.softmax(
-            (returns - returns[:, -1:]) / scale / temp, axis=-1
-        )
+        weights = mppi_weights(returns, temp, std_normalize, axis=-1)
         base_nodes = jax.vmap(lambda k: sample(k, plan, noise))(keys[0])
         drive = jnp.einsum("rn,rnij->ij", weights, base_nodes) / repeats - plan
 
@@ -509,7 +505,9 @@ def make_student_driver(policy, target_temperature=None):
     )
 
     def student(plan, obs, t, omega):
-        coefficients = (normalize_omega(omega) / temperature) @ pinv_nu
+        coefficients = mixture_from_pinv(
+            omega, temperature, pinv_nu, policy.pinv_mode_weights
+        )
         update = None
         for index, field in enumerate(fields):
             term = coefficients[index] * field.delta(plan, obs, t)

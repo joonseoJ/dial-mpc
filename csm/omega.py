@@ -80,6 +80,34 @@ def nu_coefficients(
     return target @ np.linalg.pinv(matrix)
 
 
+def mixture_from_pinv(omega, temperature, pinv_nu, pinv_mode=None):
+    """Composition coefficients from a pseudoinverse computed at fit time.
+
+    `nu_coefficients` solves this at fit time in numpy; this is the same solve
+    for a policy that already carries the pseudoinverse, traceable under jit.
+    Three call sites used to inline it -- the policy, the viewer and the
+    collector's student driver -- and only two of them carried the legacy
+    branch, so a policy fitted before temperatures were recorded worked in one
+    and crashed in another.
+
+    With `pinv_nu` the solve is in nu = omega / T and the magnitude is
+    recovered.  Without it, the policy predates that and the only thing left to
+    pin the scale with is the sum-to-one rescale the old fits used.
+    """
+
+    omega = jnp.asarray(omega, dtype=jnp.float32)
+    if pinv_nu is None:
+        raw = omega @ jnp.asarray(pinv_mode)
+        total = jnp.sum(raw)
+        # A zero sum means omega is orthogonal to the basis span; leave the raw
+        # coefficients rather than dividing by ~0 and returning garbage.
+        return jnp.where(jnp.abs(total) > 1e-6, raw / total, raw)
+    direction = normalize_omega(omega)
+    return (direction / jnp.asarray(temperature, dtype=jnp.float32)) @ (
+        jnp.asarray(pinv_nu)
+    )
+
+
 def omega_coefficients(basis_omegas, target_omega) -> np.ndarray:
     """The legacy solve: least squares in omega, rescaled to sum to one.
 

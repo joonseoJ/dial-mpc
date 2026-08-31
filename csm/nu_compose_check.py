@@ -42,7 +42,7 @@ import brax.envs as brax_envs
 from dial_mpc.core.dial_core import make_controller
 
 from csm.basis_screen import _load_config, build_omegas
-from csm.dial_lean import make_dial_step, make_rollout, make_sampler
+from csm.dial_lean import make_dial_step, make_rollout, make_sampler, mppi_weights
 from csm.omega import normalize_omega_np, nu_coefficients, omega_coefficients
 
 
@@ -87,13 +87,7 @@ def deltas(terms, nodes, plan, omegas, temps, std_normalize: bool):
     """
 
     returns = terms @ omegas.T                       # (n_sample, k)
-    reference = returns[-1]
-    if std_normalize:
-        scale = jnp.maximum(returns.std(axis=0), 1e-6)
-        logits = (returns - reference) / scale / temps
-    else:
-        logits = (returns - reference) / temps
-    weights = jax.nn.softmax(logits, axis=0)
+    weights = mppi_weights(returns, temps, std_normalize, axis=0)
     return jnp.einsum("nk,nij->kij", weights, nodes) - plan
 
 
