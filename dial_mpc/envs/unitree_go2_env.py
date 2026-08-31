@@ -157,6 +157,10 @@ class UnitreeGo2Env(BaseEnv):
             "last_contact": jnp.zeros(4, dtype=jnp.bool),
             "feet_air_time": jnp.zeros(4),
             "reward_weights": jnp.asarray(self._config.reward_weights),
+            # Per-row rewards, carried the way every later environment carries
+            # them.  A viewer or a screen that wants to show what each row is
+            # contributing has nowhere else to read it from.
+            "reward_terms": jnp.zeros(3),
         }
 
         obs = self._get_obs(pipeline_state, state_info)
@@ -292,6 +296,7 @@ class UnitreeGo2Env(BaseEnv):
         state.info["z_feet_tar"] = z_feet_tar
         state.info["feet_air_time"] *= ~contact_filt_mm
         state.info["last_contact"] = contact
+        state.info["reward_terms"] = reward_components
 
         state = state.replace(
             pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
