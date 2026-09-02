@@ -85,13 +85,22 @@ def shard_paths(folders, limit: int | None = None) -> list[str]:
 
 
 def build_datasets(paths, relabel, ess_fn, basis, names, temperature,
-                   level_scales, repeats, chunk):
+                   level_scales, repeats, chunk, min_height=0.0):
     """Relabel every shard under every basis row, streaming through the host.
 
     A collection is tens of gigabytes of stored costs and relabelling
     regenerates the sampled trajectories on top of that, so shards are processed
     one at a time and only the finished labels are kept.  Every row sees the
     identical queries, which is the property that makes the fields comparable.
+
+    `min_height` drops queries taken from a base already below that height.  A
+    DAgger round is collected wherever the student goes wrong, and where it goes
+    wrong on this plant is on its way to the floor -- states whose contacts are
+    changing fast enough that the same query rolled twice disagrees.  Measured:
+    folding a student-driven round in beside a teacher-driven one took the label
+    noise from 12.6-14.2% to 21.0-27.0% and the validation error from
+    0.184-0.242 to 0.396-0.532, on twice the data.  A state the student merely
+    strayed into is worth labelling; one it has already lost is not.
     """
 
     shared = {name: [] for name in ("u", "factor", "level", "obs", "qpos",
@@ -99,8 +108,15 @@ def build_datasets(paths, relabel, ess_fn, basis, names, temperature,
     labels = {name: [] for name in names}
     diagnostics = {name: {"sq": 0.0, "noise": 0.0, "ess": 0.0, "n": 0}
                    for name in names}
+    dropped = total = 0
     for index, path in enumerate(paths):
         clouds = load_clouds(path)
+        if min_height > 0.0:
+            keep = np.asarray(clouds.qpos)[:, 2] >= min_height
+            if not keep.all():
+                clouds = jax.tree.map(lambda x: x[keep], clouds)
+            dropped += int((~keep).sum())
+        total += int(keep.size) if min_height > 0.0 else clouds.size
         temps = query_temperatures(clouds, temperature, level_scales)
         for key in shared:
             shared[key].append(np.asarray(getattr(clouds, key)))
@@ -126,6 +142,9 @@ def build_datasets(paths, relabel, ess_fn, basis, names, temperature,
         print(f"  shard {index + 1}/{len(paths)}: {clouds.size} queries", flush=True)
         del clouds
 
+    if min_height > 0.0:
+        print(f"  height filter (>= {min_height:.2f} m): dropped {dropped:,} of "
+              f"{total:,} queries ({dropped / max(total, 1):.1%})", flush=True)
     merged = {key: np.concatenate(value) for key, value in shared.items()}
     datasets, summary = [], []
     for name in names:
@@ -164,6 +183,12 @@ def main() -> None:
                         help="clouds averaged per label; defaults to all stored")
     parser.add_argument("--shards", type=int, default=None)
     parser.add_argument("--relabel-chunk", type=int, default=4096)
+    parser.add_argument("--min-height", type=float, default=0.0,
+                        help="drop queries whose base is already below this "
+                             "height; the environment terminates at 0.18 and "
+                             "walks at 0.28-0.30, so 0.22 removes what is "
+                             "already falling without touching recoverable "
+                             "excursions")
     parser.add_argument("--hidden", type=str, default="512,512,512")
     parser.add_argument("--train-iters", type=int, default=20000)
     parser.add_argument("--batch-size", type=int, default=512)
@@ -209,6 +234,7 @@ def main() -> None:
     datasets, label_stats = build_datasets(
         paths, relabel, ess_fn, basis, args.basis, args.temperature,
         tuple(args.level_scales), args.repeats, args.relabel_chunk,
+        args.min_height,
     )
     n_sample = dial_config.Nsample + 1
     for entry in label_stats:

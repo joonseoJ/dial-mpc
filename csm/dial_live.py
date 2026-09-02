@@ -59,7 +59,7 @@ from dial_mpc.core.dial_config import DialConfig
 from dial_mpc.core.dial_core import make_controller
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 
-from csm.dial_lean import make_rollout, make_sampler
+from csm.dial_lean import make_rollout, make_sampler, mppi_weights
 from csm.dial_score_serve import FrameRenderer, _label
 
 from PIL import Image
@@ -95,41 +95,57 @@ def _load(example: str | None, config_path: Path | None):
     return dial_config, env_config
 
 
-def make_interactive_step(env, mbdpi, dial_config):
+def make_interactive_step(env, mbdpi, dial_config, std_normalize=True,
+                          level_scales=None):
     """One DIAL control step with the temperature left traced.
 
     Returns the softmax weights of the final annealing level as well, since
     that is the distribution the applied action actually came from.
+
+    `std_normalize` and `level_scales` exist so the viewer can be the same
+    controller the data was collected with.  Collection runs a raw Gibbs
+    objective -- that is what makes the score linear in the weights -- and
+    gives each annealing level its own temperature, because the coarse level's
+    returns spread about four times as wide as the fine level's and one
+    temperature across both means two different sharpnesses.  A viewer that
+    quietly kept the spread normalisation would be showing a different
+    controller than the one being trained.
     """
 
     sample = make_sampler(mbdpi, dial_config)
     rollout_vmap = jax.vmap(make_rollout(env), in_axes=(None, 0))
     sigma = mbdpi.sigma_control
     factors = dial_config.traj_diffuse_factor ** jnp.arange(dial_config.Ndiffuse)
+    profile = (jnp.ones_like(factors) if level_scales is None
+               else jnp.asarray(level_scales, dtype=factors.dtype))
+    if profile.shape != factors.shape:
+        raise ValueError(
+            f"level_scales needs {factors.shape[0]} entries, one per level"
+        )
 
     def anneal_once(state, rng, plan, noise_scale, temp):
         rng, key = jax.random.split(rng)
         nodes = sample(key, plan, noise_scale)
         us = mbdpi.node2u_vvmap(nodes)
         returns = rollout_vmap(state, us).mean(axis=-1)
-        # Exactly DIAL's normalisation: score against the proposal centre and
-        # divide by the spread of the cloud itself.
-        scale = jnp.maximum(returns.std(), 1e-6)
-        weights = jax.nn.softmax((returns - returns[-1]) / scale / temp)
+        weights = mppi_weights(returns, temp, std_normalize)
         return rng, jnp.einsum("n,nij->ij", weights, nodes), weights, returns
 
     @jax.jit
     def control_step(state, rng, plan, temp, shift):
         plan = jnp.where(shift, mbdpi.shift(plan), plan)
 
-        def body(carry, factor):
+        def body(carry, level):
             key, current = carry
+            factor, scale = level
             key, current, weights, returns = anneal_once(
-                state, key, current, sigma * factor, temp
+                state, key, current, sigma * factor, temp * scale
             )
             return (key, current), (weights, returns)
 
-        (rng, plan), (weights, returns) = jax.lax.scan(body, (rng, plan), factors)
+        (rng, plan), (weights, returns) = jax.lax.scan(
+            body, (rng, plan), (factors, profile)
+        )
         state = env.step(state, plan[0])
         return state, rng, plan, weights[-1], returns[-1]
 
@@ -157,7 +173,11 @@ class LiveDial:
             self.row_names.append(f"row{len(self.row_names)}")
 
         self._reset_env = jax.jit(self.env.reset)
-        self._control = make_interactive_step(self.env, self.mbdpi, self.dial_config)
+        self._control = make_interactive_step(
+            self.env, self.mbdpi, self.dial_config,
+            std_normalize=not args.raw_gibbs,
+            level_scales=args.level_scales,
+        )
         # Only the locomotion tasks carry a velocity command; the stand-and-
         # resist task has no use for the sliders.
         self._has_command = hasattr(env_config, "command_vx_max")
@@ -581,13 +601,28 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--ndiffuse", type=int, default=None)
     parser.add_argument("--row-names", nargs="+", default=None,
                         help="labels for the reward rows, in order")
+    parser.add_argument("--raw-gibbs", action="store_true",
+                        help="drop DIAL's spread normalisation, as the "
+                             "collection does, so the objective is a Gibbs "
+                             "distribution at the temperature on the slider")
+    parser.add_argument("--level-scales", type=float, nargs="+", default=None,
+                        help="per-level temperature profile, one entry per "
+                             "annealing level; the collection measures one and "
+                             "the viewer has to share it to be the same "
+                             "controller")
     return parser
 
 
 def main() -> None:
     args = _parser().parse_args()
     if args.row_names is None:
-        args.row_names = ROW_NAMES.get(args.example)
+        # Configs are named after the study, not the environment
+        # (`unitree_go2_trot_csm` runs `unitree_go2_walk`), so match on either.
+        key = args.example or str(args.config or "")
+        for tag, labels in ROW_NAMES.items():
+            if tag in key or key in tag:
+                args.row_names = labels
+                break
     live = LiveDial(args)
 
     app = Flask("dial_live")
