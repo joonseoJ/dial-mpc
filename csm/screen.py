@@ -58,6 +58,15 @@ GRAVITY = 9.81
 # spinning in place and a slow crawl.  A basis that only separates on a
 # straight line is the walking task again.
 COMMANDS = {
+    "random": None,          # the environment samples its own
+    # Inside the narrowed training box (vx 0.6-1.0, vy +-0.15, vyaw +-0.3):
+    # its two extremes and its two corners.  A screen run on the presets below
+    # measures a regime the fields are never trained on.
+    "box_fast": (1.0, 0.0, 0.0),
+    "box_slow": (0.6, 0.0, 0.0),
+    "box_turn": (0.8, 0.0, 0.3),
+    "box_strafe": (0.8, 0.15, 0.0),
+    # Outside it, kept as off-distribution probes.
     "straight": (1.2, 0.0, 0.0),
     "turn": (1.0, 0.0, 0.8),
     "strafe": (0.8, 0.4, 0.0),
@@ -67,7 +76,16 @@ COMMANDS = {
 
 
 def set_command(env, state, command):
-    """Pin one velocity command for the whole episode, ramp included."""
+    """Pin one velocity command for the whole episode, ramp included.
+
+    `command=None` leaves the environment's own randomisation in place, which
+    is what a screen has to do once the collection samples its commands: pinning
+    one would measure a single point of the distribution the fields are trained
+    on.
+    """
+
+    if command is None:
+        return state
 
     vel = jnp.array([command[0], command[1], 0.0])
     ang = jnp.array([0.0, 0.0, command[2]])
@@ -148,8 +166,11 @@ def make_bootstrap(env, mbdpi, dial_config, steps, std_normalize):
     return boot
 
 
-def make_closed_loop(env, mbdpi, dial_config, n_steps, std_normalize):
-    control = make_dial_step(env, mbdpi, dial_config, std_normalize=std_normalize)
+def make_closed_loop(env, mbdpi, dial_config, n_steps, std_normalize,
+                     level_scales=None):
+    control = make_dial_step(env, mbdpi, dial_config,
+                             std_normalize=std_normalize,
+                             level_scales=level_scales)
     warm = make_warm_start(env, mbdpi, dial_config, std_normalize)
 
     def diagnostics(state):
@@ -254,7 +275,7 @@ def gait_statistics(trace, env, mass, command):
 # shared cloud
 # --------------------------------------------------------------------- #
 def make_cloud(env, mbdpi, dial_config, warmup_steps, std_normalize,
-               drive_env=None):
+               drive_env=None, level_scales=None):
     """Warm up on one shared objective, then score that cloud with every omega.
 
     `drive_env` is what does the warming.  It defaults to the measured
@@ -268,7 +289,8 @@ def make_cloud(env, mbdpi, dial_config, warmup_steps, std_normalize,
 
     drive_env = env if drive_env is None else drive_env
     control = make_dial_step(drive_env, mbdpi, dial_config,
-                             std_normalize=std_normalize)
+                             std_normalize=std_normalize,
+                             level_scales=level_scales)
     warm = make_warm_start(drive_env, mbdpi, dial_config, std_normalize)
     sample = make_sampler(mbdpi, dial_config)
     final_noise = mbdpi.sigma_control * (
@@ -350,6 +372,9 @@ def main() -> None:
                              "1-3 per second, >0 prices them per metre")
     parser.add_argument("--elite-frac", type=float, default=0.02)
     parser.add_argument("--no-std-normalize", action="store_true")
+    # The cloud is drawn around a plan the warm-up produced, so the warm-up has
+    # to be the controller the data will be collected with -- profile included.
+    parser.add_argument("--level-scales", type=float, nargs="+", default=None)
     parser.add_argument("--bootstrap", type=int, default=0,
                         help="control steps of gait-referenced bootstrap before "
                              "handing the state and plan to every omega")
@@ -426,7 +451,8 @@ def main() -> None:
                 ),
             )
         cloud = make_cloud(env, mbdpi, dial_config, args.warmup, std_normalize,
-                           drive_env=drive_env)
+                           drive_env=drive_env,
+                           level_scales=args.level_scales)
         all_terms, all_done = [], []
         t0 = time.time()
         for k in range(args.states):
@@ -522,7 +548,8 @@ def main() -> None:
 
     # ---------------------------------------------------------------- #
     if args.mode in ("walk", "both"):
-        run = make_closed_loop(env, mbdpi, dial_config, args.steps, std_normalize)
+        run = make_closed_loop(env, mbdpi, dial_config, args.steps,
+                               std_normalize, args.level_scales)
         boot = None
         if args.bootstrap > 0:
             import dataclasses
