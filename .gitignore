@@ -267,3 +267,6 @@ AMENT_IGNORE
 *_predictions.npy
 
 dial_mpc_ws/
+
+# W&B local run cache; the runs live on the server.
+/wandb/
