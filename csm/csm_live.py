@@ -28,6 +28,7 @@ import os
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 import argparse
+import collections
 import dataclasses
 import io
 import threading
@@ -43,9 +44,10 @@ from brax import envs as brax_envs
 from flask import Flask, Response, jsonify, request
 
 from dial_mpc.core.dial_core import make_controller
+from dial_mpc.utils.function_utils import global_to_body_velocity
 
 from csm.basis_screen import _load_config, build_omegas
-from csm.dial_lean import make_dial_step
+from csm.dial_lean import make_dial_step, make_lean_update
 from csm.dial_score import ComposedDialScorePolicy, factor_to_t
 from csm.dial_score_serve import FrameRenderer, _label
 from csm.omega import mixture_from_pinv, normalize_omega, normalize_omega_np
@@ -145,6 +147,69 @@ class LiveComposed:
 
         self._push = push
 
+        # Velocity commands, when the environment has them.  The walking basis
+        # is conditioned on the command, so a viewer that cannot move it can
+        # only ever show one point of what the fields were fitted to.
+        probe = self._reset(jax.random.PRNGKey(0))
+        self.has_command = "vel_cmd" in probe.info
+
+        @jax.jit
+        def apply_command(state, command):
+            vel = jnp.array([command[0], command[1], 0.0])
+            ang = jnp.array([0.0, 0.0, command[2]])
+            # The environment re-derives vel_tar from vel_cmd every step and
+            # resamples it on its own schedule; pinning `randomize_target` is
+            # what stops it overwriting the slider a second later.
+            scale = self.env._command_ramp_scale(state.info["step"])
+            info = dict(state.info)
+            info["vel_cmd"] = vel
+            info["ang_vel_cmd"] = ang
+            info["vel_tar"] = vel * scale
+            info["ang_vel_tar"] = ang * scale
+            info["randomize_target"] = jnp.asarray(False)
+            state = state.replace(info=info)
+            # The command is part of the observation, so recomputing it here is
+            # what makes the slider take effect on this step rather than the
+            # next one.
+            return state.replace(obs=self.env._get_obs(state.pipeline_state, info))
+
+        self._apply_command = apply_command
+
+        @jax.jit
+        def body_velocity(state):
+            """Commanded and achieved velocity, both in the body frame.
+
+            Body frame, not world: the objective scores `vb[:2]` against
+            `vel_tar[:2]`, and a world-frame reading would disagree with it the
+            moment the robot is not facing +x.  Turning at 0.3 rad/s while
+            commanded 0.8 m/s forward, the same motion reads (+0.73, +0.01) in
+            the body frame and (+0.04, +0.66) in the world.
+
+            No degree conversion on the angular part.  `xd.ang` is already
+            rad/s, and the environment's own reward multiplies it by pi/180
+            anyway -- a 57x error that was invisible while every shipped config
+            commanded zero yaw.  Measured against a finite difference of the
+            yaw angle: truth +0.2946 rad/s, this expression +0.2941, the
+            environment's +0.0051.  The viewer reports the truth; see the note
+            on `reward_ang_vel` in the walking report.
+            """
+            ps = state.pipeline_state
+            torso = self.env._torso_idx - 1
+            vb = global_to_body_velocity(ps.xd.vel[torso], ps.x.rot[torso])
+            ab = global_to_body_velocity(ps.xd.ang[torso], ps.x.rot[torso])
+            return (jnp.stack([vb[0], vb[1], ab[2]]),
+                    jnp.stack([state.info["vel_tar"][0],
+                               state.info["vel_tar"][1],
+                               state.info["ang_vel_tar"][2]]))
+
+        self._body_velocity = body_velocity
+        self.command_box = [
+            [float(getattr(env_config, f"command_{axis}_min", lo)),
+             float(getattr(env_config, f"command_{axis}_max", hi))]
+            for axis, lo, hi in (("vx", 0.0, 1.0), ("vy", -0.3, 0.3),
+                                 ("vyaw", -0.5, 0.5))
+        ]
+
         self.with_dial = bool(args.with_dial)
         if self.with_dial:
             self.mbdpi = make_controller(dial_config, self.env)
@@ -152,6 +217,37 @@ class LiveComposed:
                 self.env, self.mbdpi, dial_config, std_normalize=False,
                 level_scales=tuple(args.level_scales),
             ))
+            # The student's first step refines from a zero plan `init_passes`
+            # times; DIAL has to be given the same opening or the comparison is
+            # about the first quarter second and not about the controller.
+            # Without it the panel lurched off a zero plan at every reset and
+            # the fall counter filled up with DIAL's starts.  Same schedule as
+            # `compose_walk_eval.make_teacher`, so the panel and the reported
+            # ratios are the same measurement.
+            update = make_lean_update(self.env, self.mbdpi, dial_config, False)
+            sigma = self.mbdpi.sigma_control
+            warm_factors = jnp.tile(
+                dial_config.traj_diffuse_factor
+                ** jnp.arange(dial_config.Ndiffuse),
+                args.init_passes,
+            )
+
+            @jax.jit
+            def dial_warm(state, rng):
+                plan = jnp.zeros(
+                    (dial_config.Hnode + 1, int(self.env.action_size)),
+                    dtype=jnp.float32,
+                )
+
+                def level(carry, factor):
+                    key, cur = carry
+                    key, cur = update(state, key, cur, sigma * factor)
+                    return (key, cur), None
+
+                (rng, plan), _ = jax.lax.scan(level, (rng, plan), warm_factors)
+                return rng, plan
+
+            self._dial_warm = dial_warm
 
         self.control_dt = float(self.env.dt)
         self.camera = args.camera or "track"
@@ -166,6 +262,9 @@ class LiveComposed:
         self.controls = {
             "omega": [1.0] * self.n_rows,
             "temperature": float(self.policy.temperature or args.temperature),
+            "command": [float(getattr(env_config, "default_vx", 0.0)),
+                        float(getattr(env_config, "default_vy", 0.0)),
+                        float(getattr(env_config, "default_vyaw", 0.0))],
         }
         self.stats: dict[str, object] = {
             "status": "starting",
@@ -175,6 +274,8 @@ class LiveComposed:
             "basis_names": self.basis_names,
             "fit_temperature": float(self.policy.temperature or args.temperature),
             "with_dial": self.with_dial,
+            "has_command": self.has_command,
+            "command_box": self.command_box,
         }
 
     # ---------------------------------------------------------------- frames
@@ -210,12 +311,14 @@ class LiveComposed:
         with self._lock:
             self._commands.append((name, payload))
 
-    def set_controls(self, omega=None, temperature=None) -> None:
+    def set_controls(self, omega=None, temperature=None, command=None) -> None:
         with self._lock:
             if omega is not None:
                 self.controls["omega"] = [float(v) for v in omega]
             if temperature is not None:
                 self.controls["temperature"] = max(float(temperature), 1e-4)
+            if command is not None:
+                self.controls["command"] = [float(v) for v in command]
 
     def _drain(self):
         with self._lock:
@@ -224,7 +327,8 @@ class LiveComposed:
             temperature = jnp.asarray(
                 self.controls["temperature"], dtype=jnp.float32
             )
-        return pending, omega, temperature
+            command = jnp.asarray(self.controls["command"], dtype=jnp.float32)
+        return pending, omega, temperature, command
 
     # ------------------------------------------------------------------ loop
     def run(self) -> None:
@@ -246,14 +350,25 @@ class LiveComposed:
         dial_cost = 0.0
         step_index = 0
         falls = 0
+        student_falls = 0
+        dial_falls = 0
+        dial_fresh = True
         history: list[float] = []
         rate_window, rate_steps, control_hz = time.perf_counter(), 0, 0.0
+        # One gait cycle of velocity history.  The trot runs at 2 Hz, so the
+        # body rates swing hard inside a stride: commanded 0.3 rad/s of yaw,
+        # the instantaneous rate measures -0.48 to +1.24 while its mean is
+        # +0.294.  A single sample on screen is therefore unreadable -- it was
+        # showing -0.208 for a robot turning correctly.  Averaging over the
+        # cycle gives +0.262 to +0.328, and the band is published alongside so
+        # the swing stays visible rather than hidden.
+        window = collections.deque(maxlen=int(round(1.0 / 2.0 / self.control_dt)))
         fresh = True
         period = 1.0 / (1.0 / self.control_dt)
         deadline = time.perf_counter()
 
         while True:
-            pending, omega, temperature = self._drain()
+            pending, omega, temperature, command = self._drain()
             reset_now = False
             for name, payload in pending:
                 if name == "reset":
@@ -271,15 +386,25 @@ class LiveComposed:
                 plan = jnp.zeros_like(plan)
                 dial_plan = plan
                 episode_step, episode_cost, dial_cost, fresh = 0, 0.0, 0.0, True
+                dial_fresh = True
+                window.clear()
 
             state.info["reward_weights"] = omega
+            if self.has_command:
+                state = self._apply_command(state, command)
+                state.info["reward_weights"] = omega
             step_fn = self._first if fresh else self._later
             state, plan, diagnostics = step_fn(state, plan, omega, temperature)
             plan.block_until_ready()
             fresh = False
 
             if self.with_dial:
+                if self.has_command:
+                    dial_state = self._apply_command(dial_state, command)
                 dial_state.info["reward_weights"] = omega
+                if dial_fresh:
+                    rng, dial_plan = self._dial_warm(dial_state, rng)
+                    dial_fresh = False
                 dial_state, rng, dial_plan = self._dial(dial_state, rng, dial_plan)
                 dial_cost += -float(dial_state.reward)
 
@@ -311,6 +436,17 @@ class LiveComposed:
                 control_hz = rate_steps / (now - rate_window)
                 rate_window, rate_steps = now, 0
 
+            if self.has_command:
+                achieved, target = self._body_velocity(state)
+                window.append(np.asarray(achieved, dtype=float))
+                stack = np.stack(window)
+                velocity = [round(float(v), 3) for v in stack.mean(axis=0)]
+                velocity_band = [[round(float(a), 3), round(float(b), 3)]
+                                 for a, b in zip(stack.min(axis=0),
+                                                 stack.max(axis=0))]
+                velocity_target = [round(float(v), 3) for v in np.asarray(target)]
+            else:
+                velocity = velocity_band = velocity_target = None
             omega_np = np.asarray(omega, dtype=float)
             unit = normalize_omega_np(omega_np)
             mixture = np.asarray(diagnostics["mixture"], dtype=float)
@@ -331,8 +467,14 @@ class LiveComposed:
                 field_share=[round(float(v), 4) for v in share],
                 update_norm=round(float(diagnostics["update_norm"]), 4),
                 falls=falls,
+                student_falls=student_falls,
+                dial_falls=dial_falls,
                 last_episodes=[round(v, 2) for v in history[-8:]],
                 best_episode=round(max(history), 2) if history else None,
+                command=[round(float(v), 3) for v in np.asarray(command)],
+                velocity=velocity,
+                velocity_band=velocity_band,
+                velocity_target=velocity_target,
                 control_hz=round(control_hz, 1),
                 realtime=round(control_hz * self.control_dt, 3),
                 seed=seed,
@@ -346,10 +488,15 @@ class LiveComposed:
                     / max(dial_cost / max(episode_step, 1), 1e-9), 3
                 )
 
-            if float(state.done) > 0.5 or (
-                self.with_dial and float(dial_state.done) > 0.5
-            ):
+            # Counted apart, because with both panels running one number
+            # cannot say which controller went down -- and the answer changes
+            # what the screen means.
+            student_down = float(state.done) > 0.5
+            dial_down = bool(self.with_dial and float(dial_state.done) > 0.5)
+            if student_down or dial_down:
                 falls += 1
+                student_falls += int(student_down)
+                dial_falls += int(dial_down)
                 history.append(episode_step * self.control_dt)
                 seed += 1
                 state = self._reset(jax.random.PRNGKey(seed))
@@ -357,6 +504,8 @@ class LiveComposed:
                 plan = jnp.zeros_like(plan)
                 dial_plan = plan
                 episode_step, episode_cost, dial_cost, fresh = 0, 0.0, 0.0, True
+                dial_fresh = True
+                window.clear()
 
             if args.realtime and not self.with_dial:
                 deadline += period
@@ -407,6 +556,21 @@ PAGE = """<!doctype html>
  .mixrow span:last-child{width:58px;text-align:right;
                          font-variant-numeric:tabular-nums;color:#c7d0dc}
  .hint{color:#8d99a9;font-size:11px;margin-top:6px;line-height:1.5}
+ .trk{display:flex;flex-direction:column;gap:11px;margin:2px 0 4px}
+ .trkrow{display:flex;align-items:center;gap:9px}
+ .trkrow>span:first-child{width:34px;color:#8d99a9;font-size:11px}
+ .track{flex:1;height:20px;background:#20262f;position:relative;overflow:hidden}
+ .track .zero{position:absolute;top:0;bottom:0;width:1px;background:#3a4350}
+ /* achieved: a bar growing from whatever 0 maps to */
+ .track u{position:absolute;top:0;bottom:0;background:#2c3947}
+ .track i{position:absolute;top:5px;bottom:5px;background:#5b9dd9}
+ .track i.miss{background:#e0925f}
+ /* commanded: a dashed rule the bar is trying to reach */
+ .track b{position:absolute;top:-1px;bottom:-1px;width:0;
+          border-left:2px dashed #e8ecf2}
+ .trkrow>span:last-child{width:96px;text-align:right;
+                         font-variant-numeric:tabular-nums;font-size:11px}
+ .err{color:#8d99a9}
 </style></head><body>
 <header><h1>composed score policy — live</h1>
  <span class="path" id="policy"></span></header>
@@ -431,6 +595,21 @@ PAGE = """<!doctype html>
   </div>
  </div>
  <div>
+  <div class="card" id="cmdcard" style="display:none">
+   <h2>속도 명령</h2>
+   <div id="cmd"></div>
+   <div class="btnrow" id="cmdpresets"></div>
+   <div class="hint" id="cmdhint"></div>
+  </div>
+  <div class="card" id="trkcard" style="display:none">
+   <h2>명령 대 실제</h2>
+   <div class="trk" id="trk"></div>
+   <div class="hint">밝은 막대가 <b>한 보행 주기(0.5초) 평균</b>, 어두운 띠가 그
+    구간의 진동 폭, 점선이 명령입니다. 몸통 좌표계입니다 — 선회 중에는 world 기준
+    속도가 vx·vy로 뒤섞이므로 명령과 비교할 수 없습니다. 한 스텝의 순간값은
+    보행 진동에 묻혀 읽을 수 없어(선회 0.3 rad/s 명령에서 순간값이 −0.48~+1.24를
+    오갑니다) 평균을 표시합니다. 오차가 크면 막대가 주황으로 바뀝니다.</div>
+  </div>
   <div class="card">
    <h2>보상 가중치 ω</h2>
    <div id="omega"></div>
@@ -486,6 +665,61 @@ function setOmega(v){v.forEach((x,i)=>{const s=document.getElementById('w'+i);
   sendOmega()}
 function sendOmega(){const v=S.row_names.map((_,i)=>+document.getElementById('w'+i).value);
   post('/controls',{omega:v})}
+const CMD=[['vx','m/s'],['vy','m/s'],['vyaw','rad/s']];
+function buildCommand(box,values){
+  // Sliders run wider than the training box on purpose: the interesting
+  // question about a command-conditioned field is where it stops working, and
+  // that is outside the box by definition.  The box is marked in the hint.
+  const span=box.map(([lo,hi])=>{const m=(hi-lo)*0.75+0.2;
+    return [Math.min(lo-m,-0.2),hi+m]});
+  cmd.innerHTML=CMD.map(([n,u],i)=>`
+   <div class="row"><label>${n}</label>
+    <input type="range" id="c${i}" min="${span[i][0].toFixed(2)}"
+     max="${span[i][1].toFixed(2)}" step="0.01" value="${values[i]}"
+     oninput="cv${i}.textContent=(+this.value).toFixed(2);sendCommand()">
+    <span class="num" id="cv${i}">${(+values[i]).toFixed(2)}</span></div>`).join('');
+  const mid=box.map(([lo,hi])=>(lo+hi)/2);
+  const sets={'정지':[0,0,0],'느리게':[box[0][0],0,0],'빠르게':[box[0][1],0,0],
+    '선회':[mid[0],0,box[2][1]],'횡이동':[mid[0],box[1][1],0],
+    '범위 밖 1.2':[1.2,0,0],'범위 밖 선회 0.8':[1.0,0,0.8]};
+  cmdpresets.innerHTML=Object.keys(sets).map(k=>
+    `<button onclick='setCommand(${JSON.stringify(sets[k])})'>${k}</button>`).join('');
+  cmdhint.innerHTML='학습 범위: '+CMD.map(([n,u],i)=>
+    `${n} ${box[i][0]}~${box[i][1]} ${u}`).join(', ')+
+    '. 이 밖은 외삽이며, 그 경계를 보라고 슬라이더는 더 넓습니다.';
+  cmdcard.style.display='';
+}
+function setCommand(v){v.forEach((x,i)=>{const s=document.getElementById('c'+i);
+  if(!s)return; s.value=x;document.getElementById('cv'+i).textContent=(+x).toFixed(2)});
+  sendCommand()}
+function sendCommand(){post('/controls',{command:CMD.map((_,i)=>
+  +document.getElementById('c'+i).value)})}
+// Full-scale for each axis, fixed so the bar length means the same thing from
+// one moment to the next; a self-scaling axis would hide exactly the overshoot
+// this card exists to show.
+const TRK=[['vx','m/s',1.6],['vy','m/s',0.6],['wz','rad/s',1.2]];
+const TOL=[0.12,0.08,0.20];        // "close enough", per axis
+function drawTracking(v,c,band){
+  if(!v||!c){return}
+  trkcard.style.display='';
+  const cl=x=>Math.max(0,Math.min(100,x));
+  trk.innerHTML=TRK.map(([n,u,full],i)=>{
+    const pos=x=>(x/full/2+0.5)*100;                 // -full..+full -> 0..100%
+    const a=cl(pos(v[i])), z=pos(0), lo=Math.min(a,z), w=Math.abs(a-z);
+    const miss=Math.abs(v[i]-c[i])>TOL[i];
+    // the swing inside one gait cycle, behind the averaged bar
+    let sw='';
+    if(band){const b0=cl(pos(band[i][0])), b1=cl(pos(band[i][1]));
+      sw=`<u style="left:${b0}%;width:${Math.max(0.6,b1-b0)}%"></u>`}
+    return `<div class="trkrow"><span>${n}</span>
+      <div class="track">
+       ${sw}<div class="zero" style="left:${z}%"></div>
+       <i class="${miss?'miss':''}" style="left:${lo}%;width:${w}%"></i>
+       <b style="left:${cl(pos(c[i]))}%"></b>
+      </div>
+      <span>${v[i].toFixed(2)} <span class="err">/ ${c[i].toFixed(2)}</span></span>
+      </div>`}).join('');
+}
 function applyTemp(log){const t=Math.pow(10,+log);tempv.textContent=t.toFixed(4);
   post('/controls',{temperature:t})}
 
@@ -494,12 +728,16 @@ async function tick(){
   policy.textContent=s.policy;
   if(s.status!=='running')return;
   if(!document.getElementById('w0')) buildOmega(s.row_names,s.omega);
+  if(s.has_command && !document.getElementById('c0'))
+    buildCommand(s.command_box,s.command);
+  drawTracking(s.velocity,s.velocity_target,s.velocity_band);
   if(tempv.textContent==='–'){temp.value=Math.log10(s.temperature);
     tempv.textContent=s.temperature.toFixed(4);
     tfit.textContent='T = '+s.fit_temperature}
   secs.textContent=s.episode_seconds.toFixed(2);
   rows(ep,[['스텝',s.episode_step],['평균 비용',s.episode_mean_cost],
-    ['낙상 횟수',s.falls],['최장 에피소드',s.best_episode??'–'],
+    ['낙상 (학생)',s.student_falls],
+    ...(s.with_dial?[['낙상 (DIAL)',s.dial_falls]]:[]),['최장 에피소드',s.best_episode??'–'],
     ['최근 (s)',(s.last_episodes||[]).join(' ')||'–']]);
   const m=s.mixture, lim=Math.max(1e-6,...m.map(Math.abs));
   mix.innerHTML=s.basis_names.map((n,i)=>{
@@ -514,6 +752,7 @@ async function tick(){
     ...s.row_names.map((n,i)=>[n,`${s.terms[i]}  ×${s.omega_unit[i]} = ${s.weighted_terms[i]}`]),
     ['ω 단위벡터',s.omega_unit.join('  ')]]);
   const r=[['제어 Hz',s.control_hz],['실시간 배속',s.realtime],['시드',s.seed]];
+  if(s.has_command)r.unshift(['명령 (vx,vy,vyaw)',(s.command||[]).join('  ')]);
   if(s.with_dial)r.push(['DIAL 평균 비용',s.dial_mean_cost],['비용 비율',s.cost_ratio]);
   rows(run,r);
 }
@@ -591,7 +830,8 @@ def main() -> None:
     def controls():
         body = request.get_json(silent=True) or {}
         live.set_controls(omega=body.get("omega"),
-                          temperature=body.get("temperature"))
+                          temperature=body.get("temperature"),
+                          command=body.get("command"))
         return jsonify(ok=True, **live.controls)
 
     @app.post("/reset")

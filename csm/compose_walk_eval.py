@@ -44,14 +44,24 @@ def _reward_done(state):
     return state.reward, state.done
 
 
+def _identity(state):
+    return state
+
+
 def make_student(env, policy, dial_config, init_passes, n_steps,
-                 record=_reward_done):
+                 record=_reward_done, transform=_identity):
     """The composed policy's own control loop, mixing solved per target.
 
     `record` picks what each step contributes to the returned trajectory.  The
     default is what scoring needs; the report's renderer passes one that keeps
     `pipeline_state` instead, so the pictures come out of this loop rather than
     a second copy of it that could drift away from the measured one.
+
+    `transform` is applied to the state after every step, for diagnostics that
+    need to intervene on it -- the observation-symmetry probe re-centres the
+    base through here.  Anything it does is invisible to the objective only if
+    the objective is invariant to it; that is the caller's problem, not this
+    loop's.
     """
 
     fields = policy.policies
@@ -83,6 +93,7 @@ def make_student(env, policy, dial_config, init_passes, n_steps,
         def body(carry, _):
             st, pl = carry
             st = env.step(st, pl[0])
+            st = transform(st)
             pl = refine(jnp.einsum("ij,ja->ia", shift, pl), st.obs, mixture, 1)
             return (st, pl), record(st)
 
