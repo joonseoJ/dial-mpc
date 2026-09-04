@@ -287,8 +287,19 @@ class UnitreeGo2Env(BaseEnv):
         vb = global_to_body_velocity(
             xd.vel[self._torso_idx - 1], x.rot[self._torso_idx - 1]
         )
+        # No degree conversion: `xd.ang` is already rad/s.  The `* pi / 180`
+        # that used to sit here shrank the measured yaw rate 57x, so the
+        # tracking row compared 0.005 against a commanded 0.3 -- asking for a
+        # true rate of 17 rad/s, unreachable, and therefore an almost constant
+        # penalty.  Worse than the offset (a softmax is blind to those) is the
+        # sensitivity: the gradient with respect to the yaw rate was 2*w_cmd/57
+        # instead of 2*w_cmd, so the row barely asked the robot to turn at all.
+        # Under a turn command it was 90% of the tracking row's magnitude and
+        # 0.4% under a straight one, which is why it stayed invisible while
+        # every shipped config commanded zero yaw.  What actually produced the
+        # turning was `reward_yaw` in the stability row, whose units are right.
         ab = global_to_body_velocity(
-            xd.ang[self._torso_idx - 1] * jnp.pi / 180.0, x.rot[self._torso_idx - 1]
+            xd.ang[self._torso_idx - 1], x.rot[self._torso_idx - 1]
         )
         reward_vel = -jnp.sum((vb[:2] - state.info["vel_tar"][:2]) ** 2)
         reward_ang_vel = -jnp.sum((ab[2] - state.info["ang_vel_tar"][2]) ** 2)
@@ -301,10 +312,25 @@ class UnitreeGo2Env(BaseEnv):
         # reward
         # CSM-compatible objective basis.  The default weights [1, 1, 1]
         # exactly reproduce the original Go2 trot reward.
+        # Heading sits with the velocities, not with posture.  It was in the
+        # stability row while the tracking row's angular term was divided by
+        # 57 and therefore inert; correcting that made the two rows ask for the
+        # same thing at different orders of derivative -- heading error is the
+        # integral of yaw-rate error -- and the basis lost its separation.
+        # Measured on a shared cloud: elite-set overlap between the pure
+        # tracking and pure stability directions went 0.006 -> 0.052 and the
+        # cross-evaluation diagonal 6/7 -> 3/7, with the rows already
+        # re-normalised to equal spread, so it was collinearity and not scale.
+        #
+        # The split is now by what the term is about rather than by derivative
+        # order: tracking owns everything that follows the command (linear
+        # velocity, yaw rate, heading), stability owns posture (how level the
+        # torso is, and how high it rides).
         reward_components = jnp.stack(
             [
-                (reward_vel + reward_ang_vel) / self._config.track_scale,
-                (reward_upright * 0.5 + reward_yaw * 0.3 + reward_height)
+                (reward_vel + reward_ang_vel + reward_yaw * 0.3)
+                / self._config.track_scale,
+                (reward_upright * 0.5 + reward_height)
                 / self._config.stability_scale,
                 reward_gaits * 0.1 / self._config.gait_scale,
             ]
@@ -418,8 +444,11 @@ class UnitreeGo2Env(BaseEnv):
         vb = global_to_body_velocity(
             xd.vel[self._torso_idx - 1], x.rot[self._torso_idx - 1]
         )
+        # Same correction as the reward: rad/s, not degrees.  The network was
+        # being shown a yaw rate 57x smaller than the truth -- effectively
+        # zero -- while being asked to control it.
         ab = global_to_body_velocity(
-            xd.ang[self._torso_idx - 1] * jnp.pi / 180.0, x.rot[self._torso_idx - 1]
+            xd.ang[self._torso_idx - 1], x.rot[self._torso_idx - 1]
         )
         if self._config.translation_invariant_observation:
             # Drop world x and y; keep height, which the stability row prices.

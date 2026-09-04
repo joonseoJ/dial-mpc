@@ -272,6 +272,96 @@ network can reproduce DIAL before composition is reintroduced.
   training anchor and ranks a checkpoint by its worst anchor score.  Unseen
   weights remain final holdouts and must not participate in selection.
 
+## Walking task: what the long horizon exposed
+
+The three-second numbers were finished long before the controller was.  At 150
+steps the composed policy showed 0 falls in 64 episodes and a median cost ratio
+of 1.253; at 1500 steps the same policy fell 64 times out of 64 while DIAL fell
+none.  Three explanations were tried and the first was wrong.
+
+- **The observation must carry the objective's symmetries.**  The reward rows
+  are velocity, torso attitude and gait phase, none of which sees where the
+  robot is or which way it faces, so the objective is invariant to planar
+  translation and to yaw.  `_get_obs` concatenated `qpos` whole -- world x, y
+  and an absolute quaternion -- and those inputs grow with the episode: three
+  metres of x in a 150-step episode, twenty-four in a 1500-step deployment.
+  Drop x and y, keep height, and replace the quaternion with the body-frame
+  gravity direction.  Falls went 64/64 -> 30/64 while the validation error
+  moved 0.16%.
+- **"No states from that time" and "no inputs in that range" are different
+  failures.**  Only the first is fixed by longer episodes; the second follows
+  the episode length in proportion, so the wall just moves.  The tell is the
+  symptom: a policy that walks to the training horizon and falls just after it
+  is out of *input* range, not short of long-horizon states.  Check the
+  symmetry before spending a day on re-collection.
+- **A reward signal the fields are asked to predict must be continuous.**
+  `yaw_tar + rate * dt * step` is the current rate times the whole elapsed
+  time, so every command resample rewrote the history -- 1.504 rad in one
+  control step at a boundary.  Integrate it instead.  Falls 30/64 -> 3/64,
+  ratio median 21.2 -> 1.441, and the stability row (which carried
+  `reward_yaw`, and which four separate measurements had called the hardest to
+  learn) improved most.  It was never a hard row; it was an incoherent target.
+- **Test observation symmetry directly, and give the intervention a no-op
+  control arm.**  Apply the transform to the state, measure `max|d obs|`;
+  fifteen lines, no training.  The first probe here rebuilt state through
+  `pipeline_init`, whose fresh state zeroes `ctrl` -- part of the observation
+  -- and the control arm collapsed 522 -> 36 steps.  Without that arm the
+  hypothesis would have been rejected.
+- **Validation error did not predict control, three times running.**  Narrowing
+  the command box moved it +2.7% and took falls 42/80 -> 0; the observation fix
+  moved it +0.16% and halved the falls; only the yaw fix moved it (-3.3%).  The
+  first two removed inputs the network was not using; the third made the target
+  predictable.  When a fitted sampling controller collapses, look at how far
+  its inputs travel and whether its targets are continuous before looking at
+  the loss curve.
+
+## `xd.ang` is rad/s
+
+Three sites multiplied it by `pi / 180`.  The tracking row therefore compared
+0.005 against a commanded 0.3 -- asking for 17 rad/s, unreachable, and so an
+almost constant penalty.  A softmax is blind to constant offsets; what mattered
+was that the gradient with respect to yaw rate was 57x too small, so the row
+barely asked the robot to turn.  Under a turn command it was 90% of the
+tracking row's magnitude and 0.4% under a straight one, which is why it stayed
+invisible while every shipped config commanded zero yaw.  What actually
+produced the turning was `reward_yaw` in the stability row.
+
+Fixing it changed the objective, and everything measured on top of the
+objective had to be re-measured:
+
+- Row spread went 1.1x to 14.3x max/min, because the angular term now has real
+  magnitude.  Re-equalise (multipliers divided by their geometric mean, so the
+  total is preserved).
+- Discriminability collapsed anyway -- diagonal 6/7 -> 3/7 with the rows
+  already balanced, and elite-set overlap between the pure tracking and pure
+  stability directions 0.006 -> 0.052.  Heading error is the integral of
+  yaw-rate error, so with both rows alive they asked for the same thing at
+  different orders of derivative.  Split the rows by *what they are about*, not
+  by derivative order: tracking owns everything that follows the command
+  (linear velocity, yaw rate, heading), stability owns posture (upright,
+  height).  Overlap halved to 0.027.
+- The temperature moved with the spread.  At 0.015 the effective sample size
+  had fallen to 3-7%; the equivalent of the old band is 0.030, where it is
+  19-30% and the diagonal is back to 6/7 (and holds 6/7 from 0.006 to 0.030).
+  Re-measure the temperature after any change to the reward -- see the
+  standing rule below, which this is the second instance of.
+
+## Fitting the fields
+
+The rows are the same cloud re-weighted, so every field sees identical
+observations, plans and factors and differs only in its label.  Train them in
+one `vmap` over stacked parameters with the inputs broadcast: the batch is then
+gathered once for all fields instead of once each.
+
+The loop was never compute-bound -- one field trains at 85 steps/s with the GPU
+at 1-3% and a 16x larger batch costs 4% -- so folding k fields into one dispatch
+is close to free.  Measured end to end on real clouds: 86 s against 230 s, 3.2x
+on the training portion, which at 300k steps is 45 minutes instead of two and a
+half hours.  Same computation, not the same bits: the row whose sequential key
+matches the shared one agrees to 1.3e-05 on validation error, the others differ
+~3% because the sequential path walks a different batch order per row.  Keep
+each field's own best checkpoint; a real run selected steps 288k, 295k and 299k.
+
 ## Verification
 
 Run the complete minimal integration test on GPU:
