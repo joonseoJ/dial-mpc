@@ -103,9 +103,12 @@ reward_weights: [1.0, 1.0, 1.0]
 # 0.25-0.51 -> 0.27-0.71, effective sample size 24-44% -> 0.9-4.0%.  The
 # multipliers below still have geometric mean 1.000, so the total magnitude is
 # unchanged and only the balance between rows moves.
-# NOTE (unverified): these were calibrated on a cloud drawn at T=0.015.  The
-# re-screen at 0.030 measured the spread at 1.8x max/min rather than 1.3x, so
-# one more equalisation pass is worth doing before the next collection.
-track_scale: 6.842
-stability_scale: 0.167
-gait_scale: 0.875
+# Equalised on a cloud drawn at the temperature actually used, 0.030.  The
+# previous pass calibrated at 0.015 and left 1.77x max/min once the planner ran
+# at 0.030 -- the spread is a property of the cloud, and the cloud depends on
+# the temperature that drew it, so the two have to be measured together.
+# Multipliers 0.722 / 1.279 / 1.084, geometric mean 1.0000, so the total
+# magnitude is unchanged and only the balance moves.
+track_scale: 9.482
+stability_scale: 0.131
+gait_scale: 0.807
