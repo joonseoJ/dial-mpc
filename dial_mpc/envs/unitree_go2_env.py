@@ -33,6 +33,32 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     ramp_up_time: float = 2.0
     gait: str = "trot"
     include_foot_height_observation: bool = False
+    # Make the observation carry the same symmetries the objective has.
+    #
+    # The three reward rows are velocity tracking, torso attitude/height, and
+    # gait phase.  Not one of them sees where the robot is or which way it
+    # faces, so the objective is invariant to translation in the plane and to
+    # yaw.  `qpos`, concatenated whole, breaks both: its first two entries are
+    # the world position of the base and its quaternion carries absolute yaw.
+    #
+    # Those inputs then grow with the episode.  Collection ran 150-step
+    # episodes, so x only ever spanned about three metres; a 1500-step
+    # deployment takes it to twenty-four, and the fitted fields fall at around
+    # eleven seconds -- roughly where x leaves the range they were fitted on.
+    # Lengthening the episodes moves that wall in proportion instead of
+    # removing it.  Measured directly: zeroing x and y in the observation
+    # alone, with the physics untouched, took four of eight target weights from
+    # falling at 5-14 s to walking the full 30 s, and their cost from 1.5-5.6
+    # down to 0.11-0.33.
+    #
+    # `yaw_error_observation` is a separate defect on the same line.  The
+    # stability row prices yaw against a target that integrates the commanded
+    # rate, and neither that target nor the step counter is in the observation
+    # -- the field is asked to predict a term it cannot see.  Absolute yaw
+    # stands in for it only while the episode is short enough that the two are
+    # confounded.
+    translation_invariant_observation: bool = False
+    yaw_error_observation: bool = False
     enable_body_collisions: bool = False
     command_vx_min: float = -1.5
     command_vx_max: float = 1.5
@@ -243,11 +269,15 @@ class UnitreeGo2Env(BaseEnv):
         vec_tar = jnp.array([0.0, 0.0, 1.0])
         vec = math.rotate(vec_tar, x.rot[0])
         reward_upright = -jnp.sum(jnp.square(vec - vec_tar))
-        # yaw orientation reward
-        yaw_tar = (
-            state.info["yaw_tar"]
-            + state.info["ang_vel_tar"][2] * self.dt * state.info["step"]
-        )
+        # yaw orientation reward.  The target is integrated step by step (see
+        # the end of this method), not recomputed as rate x elapsed time.  The
+        # latter is only equivalent while the command never changes: with
+        # randomised commands it re-derives the whole history from whatever
+        # rate is current, so the target jumped -- measured at up to 1.5 rad in
+        # one control step at a resampling boundary.  That discontinuity was in
+        # the stability row all along, and putting the same expression into the
+        # observation fed it straight to the fields.
+        yaw_tar = state.info["yaw_tar"]
         yaw = math.quat_to_euler(x.rot[self._torso_idx - 1])[2]
         d_yaw = yaw - yaw_tar
         reward_yaw = -jnp.square(jnp.atan2(jnp.sin(d_yaw), jnp.cos(d_yaw)))
@@ -298,6 +328,13 @@ class UnitreeGo2Env(BaseEnv):
 
         # state management
         state.info["step"] += 1
+        # Advance the yaw target by one step of the commanded rate.  For a
+        # constant command this reproduces the old `rate * dt * step` exactly;
+        # when the command changes it carries the accumulated heading forward
+        # instead of rewriting it from the new rate.
+        state.info["yaw_tar"] = (
+            state.info["yaw_tar"] + state.info["ang_vel_tar"][2] * self.dt
+        )
         state.info["rng"] = rng
         state.info["z_feet"] = z_feet
         state.info["z_feet_tar"] = z_feet_tar
@@ -384,15 +421,40 @@ class UnitreeGo2Env(BaseEnv):
         ab = global_to_body_velocity(
             xd.ang[self._torso_idx - 1] * jnp.pi / 180.0, x.rot[self._torso_idx - 1]
         )
+        if self._config.translation_invariant_observation:
+            # Drop world x and y; keep height, which the stability row prices.
+            # Replace the quaternion with the gravity direction in the body
+            # frame, which carries roll and pitch and is blind to yaw -- the
+            # standard locomotion choice, for exactly this reason.
+            gravity_body = math.rotate(
+                jnp.array([0.0, 0.0, -1.0]),
+                math.quat_inv(x.rot[self._torso_idx - 1]),
+            )
+            pose = jnp.concatenate([
+                pipeline_state.qpos[2:3], gravity_body, pipeline_state.qpos[7:]
+            ])
+        else:
+            pose = pipeline_state.qpos
         features = [
             state_info["vel_tar"],
             state_info["ang_vel_tar"],
             pipeline_state.ctrl,
-            pipeline_state.qpos,
+            pose,
             vb,
             ab,
             pipeline_state.qvel[6:],
         ]
+        if self._config.yaw_error_observation:
+            # The wrapped error the stability row actually charges for, rather
+            # than an absolute yaw the field cannot difference against
+            # anything.  Same expression as the reward, kept here so the two
+            # cannot drift apart.
+            yaw_tar = state_info["yaw_tar"]
+            yaw = math.quat_to_euler(x.rot[self._torso_idx - 1])[2]
+            d_yaw = yaw - yaw_tar
+            features.append(
+                jnp.stack([jnp.sin(d_yaw), jnp.cos(d_yaw)])
+            )
         if self._config.include_foot_height_observation:
             duty_ratio, cadence, amplitude = self._gait_params[self._gait]
             phases = self._gait_phase[self._gait]

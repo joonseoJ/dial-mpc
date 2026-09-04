@@ -74,6 +74,17 @@ command_vy_min: -0.15
 command_vy_max: 0.15
 command_vyaw_min: -0.3
 command_vyaw_max: 0.3
+# Observation symmetry.  The three reward rows never look at where the robot
+# is or which way it faces, but `qpos` went into the observation whole, so the
+# fields were conditioned on world x, y and absolute yaw -- inputs that grow
+# with the episode.  Fitted on 150-step episodes and deployed for 1500, the
+# student fell at about 11 s, roughly where x left the fitted range, and
+# lengthening the episodes only moves that wall in proportion.  Zeroing x and
+# y in the observation alone, physics untouched, took four of eight target
+# weights from falling at 5-14 s to walking the full 30 s.
+translation_invariant_observation: true
+yaw_error_observation: true
+
 reward_weights: [1.0, 1.0, 1.0]
 
 # Row normalizers, measured on a shared cloud at this temperature and applied
