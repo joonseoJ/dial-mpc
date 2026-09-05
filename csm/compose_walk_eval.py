@@ -177,6 +177,14 @@ def main() -> None:
                              "randomised its command")
     parser.add_argument("--seeds", type=int, default=2)
     parser.add_argument("--steps", type=int, default=150)
+    parser.add_argument("--also-report", type=int, nargs="*", default=None,
+                        help="extra horizons to score from the same rollouts. "
+                             "A short evaluation is a prefix of a long one -- "
+                             "same policy, same seed, same command -- so "
+                             "`--steps 1500 --also-report 150` replaces a "
+                             "second pass that cost as much as the first, and "
+                             "the two numbers then come from one trajectory "
+                             "rather than two")
     parser.add_argument("--init-passes", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--row-scales", type=float, nargs="+", default=None,
@@ -229,7 +237,14 @@ def main() -> None:
           f"levels={args.level_scales}  "
           f"row_scales={args.row_scales or 'from config'}  "
           f"fields={len(policy.policies)}  nu={policy.pinv_nu_weights is not None}")
-    report = {}
+    horizons = sorted({args.steps, *(args.also_report or [])})
+    for h in horizons:
+        if h > args.steps:
+            raise ValueError(
+                f"--also-report {h} exceeds --steps {args.steps}; a horizon can "
+                "only be scored from a rollout at least that long"
+            )
+    report: dict[int, dict] = {h: {} for h in horizons}
     train_command = (float(env_config.default_vx), float(env_config.default_vy),
                      float(env_config.default_vyaw))
     for cname in args.commands.split(","):
@@ -239,34 +254,53 @@ def main() -> None:
         print(f"{'target':<9}{'DIAL cost':>11}{'student':>10}{'ratio':>8}"
               f"{'D.fall':>8}{'S.fall':>8}{'S.alive':>9}")
         for name, omega in targets.items():
-            teach, stud, tf, sf, alive = [], [], 0, 0, []
+            acc = {h: {"teach": [], "stud": [], "tf": 0, "sf": 0, "alive": []}
+                   for h in horizons}
             for seed in range(args.seeds):
                 state = reset(jax.random.PRNGKey(11 + seed))
                 state = set_command(env, state, command)
                 state = set_omega(state, omega)
-                r, d = teacher(state, jax.random.PRNGKey(seed))
-                c, fell, _ = summarise(r, d, args.steps)
-                teach.append(c); tf += fell
-                r, d = student(state, jnp.asarray(omega), temperature)
-                c, fell, a = summarise(r, d, args.steps)
-                stud.append(c); sf += fell; alive.append(a)
-            t, s = float(np.mean(teach)), float(np.mean(stud))
-            report[f"{cname}/{name}"] = {
-                "dial_cost": t, "student_cost": s, "ratio": s / max(t, 1e-9),
-                "dial_falls": tf, "student_falls": sf,
-                "student_alive": float(np.mean(alive)),
-            }
-            print(f"{name:<9}{t:11.4f}{s:10.4f}{s / max(t, 1e-9):8.3f}"
-                  f"{tf:8d}{sf:8d}{np.mean(alive):9.0f}", flush=True)
+                tr, td = teacher(state, jax.random.PRNGKey(seed))
+                sr, sd = student(state, jnp.asarray(omega), temperature)
+                for h in horizons:
+                    c, fell, _ = summarise(tr[:h], td[:h], h)
+                    acc[h]["teach"].append(c); acc[h]["tf"] += fell
+                    c, fell, a = summarise(sr[:h], sd[:h], h)
+                    acc[h]["stud"].append(c); acc[h]["sf"] += fell
+                    acc[h]["alive"].append(a)
+            for h in horizons:
+                a = acc[h]
+                t, s = float(np.mean(a["teach"])), float(np.mean(a["stud"]))
+                entry = {
+                    "dial_cost": t, "student_cost": s, "ratio": s / max(t, 1e-9),
+                    "dial_falls": a["tf"], "student_falls": a["sf"],
+                    "student_alive": float(np.mean(a["alive"])), "steps": h,
+                }
+                report.setdefault(h, {})[f"{cname}/{name}"] = entry
+                if h == args.steps:
+                    print(f"{name:<9}{t:11.4f}{s:10.4f}{s / max(t, 1e-9):8.3f}"
+                          f"{a['tf']:8d}{a['sf']:8d}{np.mean(a['alive']):9.0f}",
+                          flush=True)
 
-    ratios = [v["ratio"] for v in report.values()]
-    print(f"\nmean ratio {np.mean(ratios):.3f}   "
-          f"student falls {sum(v['student_falls'] for v in report.values())}   "
-          f"DIAL falls {sum(v['dial_falls'] for v in report.values())}")
+    for h in horizons:
+        rows = report[h]
+        ratios = [v["ratio"] for v in rows.values()]
+        print(f"\n{h} steps ({h * float(env.dt):.1f} s): "
+              f"mean ratio {np.mean(ratios):.3f}   "
+              f"median {np.median(ratios):.3f}   "
+              f"student falls {sum(v['student_falls'] for v in rows.values())}"
+              f"/{len(rows) * args.seeds}   "
+              f"DIAL falls {sum(v['dial_falls'] for v in rows.values())}")
     if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(json.dumps(report, indent=2, default=float))
-        print(f"wrote {args.out}")
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        for h in horizons:
+            # One file per horizon, so everything that already reads these
+            # keeps working.
+            path = out if h == args.steps else out.with_name(
+                f"{out.stem}_{h}{out.suffix}")
+            path.write_text(json.dumps(report[h], indent=2, default=float))
+            print(f"wrote {path}")
 
 
 if __name__ == "__main__":

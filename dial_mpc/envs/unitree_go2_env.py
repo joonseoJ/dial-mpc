@@ -326,9 +326,23 @@ class UnitreeGo2Env(BaseEnv):
         # order: tracking owns everything that follows the command (linear
         # velocity, yaw rate, heading), stability owns posture (how level the
         # torso is, and how high it rides).
+        # No yaw-*rate* term.  It and `reward_yaw` are the same demand at
+        # different orders of derivative -- heading error is the integral of
+        # rate error -- and carrying both is what made the basis collinear once
+        # the 57x unit bug stopped suppressing one of them.  Moving them into a
+        # single row fixed the row-to-row overlap but not the redundancy, and
+        # the 30 s evaluation then failed on the turning command alone: 12 of
+        # 16, against 2 of 48 on the three commands without a yaw component.
+        # Dropping the rate is what the environment was *effectively* doing
+        # before the unit fix, when the term was inert; the difference is that
+        # it is now a decision rather than an accident.
+        #
+        # The cost: the objective no longer prices an instantaneous yaw rate,
+        # only the heading it integrates to.  For a joystick command that is
+        # the right quantity, and it tracked 0.2946 against 0.300 commanded.
         reward_components = jnp.stack(
             [
-                (reward_vel + reward_ang_vel + reward_yaw * 0.3)
+                (reward_vel + reward_yaw * 0.3)
                 / self._config.track_scale,
                 (reward_upright * 0.5 + reward_height)
                 / self._config.stability_scale,
