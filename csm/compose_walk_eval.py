@@ -37,6 +37,7 @@ from csm.basis_screen import _load_config, build_omegas
 from csm.dial_lean import make_dial_step, make_lean_update, mppi_logits
 from csm.dial_score import ComposedDialScorePolicy, factor_to_t
 from csm.omega import mixture_from_pinv, normalize_omega_np
+from csm.rl_baseline import load_policy as load_rl_policy
 from csm.screen import COMMANDS, set_command, set_omega
 from csm.teacher_cache import (DEFAULT_ROOT, TeacherCache, episode_key,
                                fingerprint)
@@ -149,6 +150,32 @@ def make_teacher(env, mbdpi, dial_config, init_passes, std_normalize,
     return run
 
 
+def make_rl_student(env, inference, n_steps, record=_reward_done):
+    """A trained-at-one-weight RL policy, run through the same loop.
+
+    Signature-compatible with `make_student` so the scoring path, the cached
+    teacher and the summary are literally the same code.  `omega` and
+    `temperature` are accepted and ignored: an RL policy has no weight input,
+    which is the whole point of the comparison -- it answers for the one weight
+    it was trained at and the caller is responsible for asking only that one.
+    """
+
+    @jax.jit
+    def run(state, omega, temperature):
+        def body(carry, _):
+            st, key = carry
+            key, sub = jax.random.split(key)
+            action, _ = inference(st.obs, sub)
+            st = env.step(st, action)
+            return (st, key), record(st)
+
+        _, out = jax.lax.scan(
+            body, (state, jax.random.PRNGKey(0)), None, length=n_steps)
+        return out
+
+    return run
+
+
 def summarise(reward, done, n_steps):
     """Mean cost over the whole episode, and how long it stayed up.
 
@@ -166,7 +193,15 @@ def summarise(reward, done, n_steps):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--policy", type=Path,
+                        help="a composed score-field policy")
+    # The RL baseline is trained at one weight and has no weight input, so
+    # it can only be scored at that weight -- the target list comes from
+    # the policy rather than the command line, and asking for others would
+    # quietly report a policy answering a question it was never asked.
+    source.add_argument("--rl-policy", type=Path,
+                        help="a fixed-weight policy from csm.rl_baseline")
     parser.add_argument("--example", default="unitree_go2_trot_csm")
     parser.add_argument("--targets", nargs="+",
                         default=["uniform", "boost0", "boost1", "boost2",
@@ -222,9 +257,15 @@ def main() -> None:
             env_config, track_scale=track, stability_scale=stability,
             gait_scale=gait,
         )
-    policy = ComposedDialScorePolicy.load(args.policy)
-    temperature = args.temperature or float(policy.temperature or
-                                            dial_config.temp_sample)
+    if args.rl_policy is not None:
+        inference, blob = load_rl_policy(args.rl_policy)
+        policy = None
+        temperature = args.temperature or float(dial_config.temp_sample)
+    else:
+        inference = blob = None
+        policy = ComposedDialScorePolicy.load(args.policy)
+        temperature = args.temperature or float(policy.temperature or
+                                                dial_config.temp_sample)
     dial_config = dataclasses.replace(dial_config, temp_sample=temperature)
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
     mbdpi = make_controller(dial_config, env)
@@ -233,13 +274,24 @@ def main() -> None:
     n_rows = int(np.asarray(env_config.reward_weights).shape[0])
     catalogue = build_omegas(n_rows)
     targets = {}
-    for name in args.targets:
-        targets[name] = (catalogue[name] if name in catalogue
-                         else normalize_omega_np(
-                             np.array([float(v) for v in name.split(",")])))
+    if blob is not None:
+        name = blob.get("omega_name") or "rl"
+        targets[name] = normalize_omega_np(
+            np.asarray(blob["omega"], dtype=float))
+        args.targets = [name]
+        print(f"rl policy trained at {name} = "
+              f"{np.round(targets[name], 4).tolist()}; scoring that weight only")
+    else:
+        for name in args.targets:
+            targets[name] = (catalogue[name] if name in catalogue
+                             else normalize_omega_np(
+                                 np.array([float(v) for v in name.split(",")])))
 
-    student = make_student(env, policy, dial_config, args.init_passes,
-                           args.steps)
+    if inference is not None:
+        student = make_rl_student(env, inference, args.steps)
+    else:
+        student = make_student(env, policy, dial_config, args.init_passes,
+                               args.steps)
     teacher = make_teacher(env, mbdpi, dial_config, args.init_passes,
                            args.std_normalize, args.steps,
                            tuple(args.level_scales))
@@ -261,11 +313,13 @@ def main() -> None:
                              refresh=args.refresh_teacher_cache)
         print(f"teacher cache {cache.dir}")
 
-    print(f"policy {args.policy}")
+    print(f"policy {args.rl_policy or args.policy}")
     print(f"env {dial_config.env_name}  T={temperature}  "
           f"levels={args.level_scales}  "
           f"row_scales={args.row_scales or 'from config'}  "
-          f"fields={len(policy.policies)}  nu={policy.pinv_nu_weights is not None}")
+          + ("  arm=rl" if policy is None else
+             f"  fields={len(policy.policies)}  "
+             f"nu={policy.pinv_nu_weights is not None}"))
     horizons = sorted({args.steps, *(args.also_report or [])})
     for h in horizons:
         if h > args.steps:

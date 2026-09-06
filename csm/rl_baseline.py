@@ -179,7 +179,7 @@ def train(args, env):
 
 
 def save_policy(path: Path, *, algo, hidden, params, obs_size, act_size,
-                omega, temperature=None):
+                omega, omega_name=None, temperature=None):
     """Enough to rebuild the deterministic policy without the trainer.
 
     The parameters alone are not a policy: the observation normaliser's
@@ -193,6 +193,9 @@ def save_policy(path: Path, *, algo, hidden, params, obs_size, act_size,
             "algo": algo, "hidden": tuple(hidden), "params": params,
             "observation_size": int(obs_size), "action_size": int(act_size),
             "omega": np.asarray(omega, dtype=float).tolist(),
+            # The name as well as the vector, so the evaluation labels the row
+            # the way every other arm's table does.
+            "omega_name": omega_name,
             "temperature": temperature,
         }, handle)
 
@@ -296,7 +299,8 @@ def main() -> None:
     save_policy(args.output / "policy.pkl", algo=args.algo,
                 hidden=tuple(int(v) for v in args.hidden.split(",")),
                 params=params, obs_size=env.observation_size,
-                act_size=env.action_size, omega=omega)
+                act_size=env.action_size, omega=omega,
+                omega_name=args.omega)
     report = {
         "algo": args.algo, "omega_name": args.omega,
         "omega": np.asarray(omega, dtype=float).tolist(),
