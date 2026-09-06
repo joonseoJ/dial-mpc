@@ -31,13 +31,15 @@ import jax.numpy as jnp
 
 import brax.envs as brax_envs
 import dial_mpc.envs as dial_envs  # noqa: F401  (registers the environments)
-from dial_mpc.core.dial_core import make_controller
+from dial_mpc.core.dial_core import MBDPI, make_controller
 
 from csm.basis_screen import _load_config, build_omegas
-from csm.dial_lean import make_dial_step, make_lean_update
+from csm.dial_lean import make_dial_step, make_lean_update, mppi_logits
 from csm.dial_score import ComposedDialScorePolicy, factor_to_t
 from csm.omega import mixture_from_pinv, normalize_omega_np
 from csm.screen import COMMANDS, set_command, set_omega
+from csm.teacher_cache import (DEFAULT_ROOT, TeacherCache, episode_key,
+                               fingerprint)
 
 
 def _reward_done(state):
@@ -201,6 +203,16 @@ def main() -> None:
                         help="per-level temperature profile the data was "
                              "collected under; the teacher has to share it")
     parser.add_argument("--out", default=None)
+    # DIAL is ~99.9% of an evaluation and does not depend on the student,
+    # so scoring a second controller on the same grid is nearly free.  The
+    # key covers the configs, the environment class's source and the
+    # planner functions, so an objective change lands in a new directory
+    # rather than silently reusing the old numbers.
+    parser.add_argument("--teacher-cache", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument("--no-teacher-cache", action="store_true")
+    parser.add_argument("--refresh-teacher-cache", action="store_true",
+                        help="recompute and overwrite every episode; for "
+                             "checking that a cached grid still reproduces")
     args = parser.parse_args()
 
     dial_config, env_config = _load_config(args.example, None)
@@ -232,6 +244,23 @@ def main() -> None:
                            args.std_normalize, args.steps,
                            tuple(args.level_scales))
 
+    cache = None
+    if not args.no_teacher_cache:
+        digest, manifest = fingerprint(
+            dial_config=dial_config, env_config=env_config, env=env,
+            functions=(make_teacher, make_dial_step, make_lean_update,
+                       mppi_logits, MBDPI, type(mbdpi)),
+            # Everything the teacher closure is built with that is not already
+            # in the two configs.
+            extra={"init_passes": int(args.init_passes),
+                   "std_normalize": bool(args.std_normalize),
+                   "level_scales": [float(v) for v in args.level_scales],
+                   "temperature": float(temperature)},
+        )
+        cache = TeacherCache(args.teacher_cache, digest, manifest,
+                             refresh=args.refresh_teacher_cache)
+        print(f"teacher cache {cache.dir}")
+
     print(f"policy {args.policy}")
     print(f"env {dial_config.env_name}  T={temperature}  "
           f"levels={args.level_scales}  "
@@ -260,7 +289,15 @@ def main() -> None:
                 state = reset(jax.random.PRNGKey(11 + seed))
                 state = set_command(env, state, command)
                 state = set_omega(state, omega)
-                tr, td = teacher(state, jax.random.PRNGKey(seed))
+                ekey = episode_key(omega=omega, command=command, seed=seed)
+                cached = cache.load(ekey, args.steps) if cache else None
+                if cached is None:
+                    tr, td = teacher(state, jax.random.PRNGKey(seed))
+                    tr, td = np.asarray(tr), np.asarray(td)
+                    if cache is not None:
+                        cache.store(ekey, tr, td)
+                else:
+                    tr, td = cached
                 sr, sd = student(state, jnp.asarray(omega), temperature)
                 for h in horizons:
                     c, fell, _ = summarise(tr[:h], td[:h], h)
@@ -282,6 +319,8 @@ def main() -> None:
                           f"{a['tf']:8d}{a['sf']:8d}{np.mean(a['alive']):9.0f}",
                           flush=True)
 
+    if cache is not None:
+        print(f"\n{cache.summary()}")
     for h in horizons:
         rows = report[h]
         ratios = [v["ratio"] for v in rows.values()]

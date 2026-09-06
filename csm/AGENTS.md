@@ -362,6 +362,33 @@ matches the shared one agrees to 1.3e-05 on validation error, the others differ
 ~3% because the sequential path walks a different batch order per row.  Keep
 each field's own best checkpoint; a real run selected steps 288k, 295k and 299k.
 
+## Caching the teacher
+
+DIAL is ~99.9% of what `compose_walk_eval` costs and does not depend on the
+student, so scoring a second controller on the same grid recomputes an
+identical set of trajectories.  `csm/teacher_cache.py` stores each episode's
+`(reward, done)` under a fingerprint and is on by default; `--no-teacher-cache`
+and `--refresh-teacher-cache` turn it off or force a recompute.  Measured on
+two 1500-step episodes: 269 s cold against 41 s warm, and the warm number is
+almost all import and student jit.  A 64-episode grid holds ~900 KB.
+
+The danger in a cache like this is the hit that should have been a miss, and on
+this project every objective change so far has been a *code* edit -- a reward
+row deleted, a unit corrected -- which a config-only key would sail straight
+past.  So the key covers the two configs hashed whole via `dataclasses.asdict`
+(never a hand-picked subset, so a field added later changes the key without
+anyone remembering to come back), the environment class's own source walked up
+its MRO, the planner functions that turn returns into an update, and the
+backend platform.  Verified: editing `reward_gaits * 0.1` to `* 0.11` with the
+config untouched moves the fingerprint and reverting restores it exactly.
+
+A miss is always safe because it recomputes, so nothing refuses -- a changed
+objective simply lands in a different directory.  Horizons compose the way
+`--also-report` does: a cached 1500-step episode answers a 150-step request by
+truncation, and a longer request is a miss that replaces it.  The DIAL column
+reproduces exactly on a hit; the *ratio* still moves in the fourth digit
+because the student's own forward passes are not bit-reproducible on GPU.
+
 ## Verification
 
 Run the complete minimal integration test on GPU:
