@@ -362,6 +362,37 @@ matches the shared one agrees to 1.3e-05 on validation error, the others differ
 ~3% because the sequential path walks a different batch order per row.  Keep
 each field's own best checkpoint; a real run selected steps 288k, 295k and 299k.
 
+## The single-weight RL baseline
+
+The controller CSM has to beat is not DIAL -- DIAL is the teacher and wins on
+quality by construction -- but the obvious alternative: RL trained at the one
+weight you want.  `csm/rl_baseline.py` runs it, PPO or SAC, and needs no new
+reward code: `unitree_go2_walk` already computes
+`normalize_omega(info["reward_weights"]) . reward_components`, so pinning omega
+is a config field.  Carry the row normalisers with it or the costs are not
+comparable.
+
+**`omega . C <= 0` everywhere**, because every row is a negative squared error
+and `reward_alive` is computed and then left out of `reward_components`.
+Paired with a `done` that fires when the torso drops, that makes falling
+*optimal* -- terminating cuts the bootstrap and stops the bleeding -- and a
+value-based learner finds it long before it finds walking.  Neither other arm
+may do that: `compose_walk_eval.summarise` scores the full horizon and the
+environment keeps stepping after `done`, and DIAL plans a fixed H.  So
+`FixedHorizonWrapper` suppresses the flag while the physics, the ground and the
+per-step charge all continue.  This is not a favour to the baseline, it is what
+puts the three arms on one objective; `--terminate` keeps the naive setup for
+the demonstration.
+
+Do not reach for `bootstrap_on_timeout=True`: it wants the environment to set
+`info['time_out']`, brax's own `EpisodeWrapper` sets `truncation` instead, and
+the GAE in `ppo/losses.py` already masks on that.  Asking for the other one
+raises `KeyError: 'time_out'`.
+
+`--randomize-start` is a no-op under the walking configs: `randomize_start_state`
+gates noise fields that all default to 0.0 and no shipped yaml sets them, so
+turning it on without also setting `start_*_noise` changes nothing.
+
 ## Caching the teacher
 
 DIAL is ~99.9% of what `compose_walk_eval` costs and does not depend on the
