@@ -85,8 +85,15 @@ def shard_paths(folders, limit: int | None = None) -> list[str]:
     return paths
 
 
+def _slug(name: str) -> str:
+    """A weight name that is safe as a filename; `3,1,2` becomes `3-1-2`."""
+
+    return name.replace(",", "-")
+
+
 def build_datasets(paths, relabel, ess_fn, basis, names, temperature,
-                   level_scales, repeats, chunk, min_height=0.0):
+                   level_scales, repeats, chunk, min_height=0.0,
+                   absolute=False):
     """Relabel every shard under every basis row, streaming through the host.
 
     A collection is tens of gigabytes of stored costs and relabelling
@@ -150,6 +157,16 @@ def build_datasets(paths, relabel, ess_fn, basis, names, temperature,
     datasets, summary = [], []
     for name in names:
         delta = np.concatenate(labels[name])
+        if absolute:
+            # Behaviour cloning: predict the plan DIAL arrives at rather than
+            # the step it takes to get there.  The two are one skip connection
+            # apart for a network that already sees `u`, so this is not a
+            # capacity question -- what changes is that an absolute plan does
+            # not compose.  `sum a_i (u + delta_i)` is the plan for `sum a_i
+            # nu_i` only when the coefficients happen to sum to one, so an
+            # absolute field answers for the weight it was fitted at and
+            # nothing else, exactly like an RL policy.
+            delta = delta + merged["u"]
         datasets.append(DialScoreData(
             u=jnp.asarray(merged["u"]), factor=jnp.asarray(merged["factor"]),
             level=jnp.asarray(merged["level"]), delta=jnp.asarray(delta),
@@ -199,6 +216,11 @@ def main() -> None:
     parser.add_argument("--level-loss-balance", type=float, default=0.0)
     parser.add_argument("--save-datasets", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--absolute", action="store_true",
+                        help="fit the updated plan instead of the update -- "
+                             "behaviour cloning of DIAL.  The field then "
+                             "answers only for the weight it was fitted at, "
+                             "so score it with compose_walk_eval --absolute")
     parser.add_argument("--sequential-fit", action="store_true",
                         help="train the fields one after another instead of "
                              "stacking them into one vmapped loop; the loop is "
@@ -218,7 +240,15 @@ def main() -> None:
 
     n_rows = int(np.asarray(env_config.reward_weights).shape[0])
     catalogue = build_omegas(n_rows)
-    basis = np.stack([catalogue[name] for name in args.basis])
+    # A catalogue name, or a literal `a,b,c`.  Fitting a field directly at an
+    # arbitrary target is what separates composition error from distillation
+    # error: at a weight a field was trained on there is no composition left to
+    # blame for what the controller does.
+    basis = np.stack([
+        catalogue[name] if name in catalogue
+        else normalize_omega_np(np.array([float(v) for v in name.split(",")]))
+        for name in args.basis
+    ])
     if len(args.basis) > n_rows:
         raise ValueError(
             f"{len(args.basis)} basis weights in a {n_rows}-row reward cannot "
@@ -241,7 +271,7 @@ def main() -> None:
     datasets, label_stats = build_datasets(
         paths, relabel, ess_fn, basis, args.basis, args.temperature,
         tuple(args.level_scales), args.repeats, args.relabel_chunk,
-        args.min_height,
+        args.min_height, args.absolute,
     )
     n_sample = dial_config.Nsample + 1
     for entry in label_stats:
@@ -252,7 +282,7 @@ def main() -> None:
     print(f"[fit] {datasets[0].size:,} training rows per field")
     if args.save_datasets:
         for row, name in enumerate(args.basis):
-            save_dial_score_data(run_dir / f"dataset_{name}.npz", datasets[row])
+            save_dial_score_data(run_dir / f"dataset_{_slug(name)}.npz", datasets[row])
 
     observation_size = int(datasets[0].obs.shape[-1])
     hidden = tuple(int(v) for v in args.hidden.split(","))
@@ -337,7 +367,7 @@ def main() -> None:
     )
     policy.save(run_dir / "policy.pkl")
     for row, name in enumerate(args.basis):
-        field(row).save(run_dir / f"field_{name}.pkl")
+        field(row).save(run_dir / f"field_{_slug(name)}.pkl")
 
     check = {
         name: np.asarray(policy.coefficients(jnp.asarray(basis[row]))).tolist()

@@ -52,7 +52,7 @@ def _identity(state):
 
 
 def make_student(env, policy, dial_config, init_passes, n_steps,
-                 record=_reward_done, transform=_identity):
+                 record=_reward_done, transform=_identity, absolute=False):
     """The composed policy's own control loop, mixing solved per target.
 
     `record` picks what each step contributes to the returned trajectory.  The
@@ -65,6 +65,13 @@ def make_student(env, policy, dial_config, init_passes, n_steps,
     base through here.  Anything it does is invisible to the objective only if
     the objective is invariant to it; that is the caller's problem, not this
     loop's.
+
+    `absolute` switches the refinement from `plan + mix(deltas)` to `mix(plan
+    predictions)`, for a field fitted with `fit_from_clouds --absolute`.  That
+    is behaviour cloning of DIAL, and it is only meaningful for a single field
+    at the weight it was fitted at: mixing absolute plans across weights is not
+    a composition of anything.  The loop is otherwise identical, so the two
+    arms are compared through the same code.
     """
 
     fields = policy.policies
@@ -78,9 +85,9 @@ def make_student(env, policy, dial_config, init_passes, n_steps,
         def level(carry, factor):
             t = factor_to_t(factor, lo, hi).reshape(1)
             parts = jnp.stack([f.delta(carry, obs, t) for f in fields])
-            return jnp.clip(
-                carry + jnp.einsum("k,kij->ij", mixture, parts), -1.0, 1.0
-            ), None
+            mixed = jnp.einsum("k,kij->ij", mixture, parts)
+            return jnp.clip(mixed if absolute else carry + mixed,
+                            -1.0, 1.0), None
 
         plan, _ = jax.lax.scan(level, plan, jnp.tile(factors, passes))
         return plan
@@ -202,6 +209,10 @@ def main() -> None:
     # quietly report a policy answering a question it was never asked.
     source.add_argument("--rl-policy", type=Path,
                         help="a fixed-weight policy from csm.rl_baseline")
+    parser.add_argument("--absolute", action="store_true",
+                        help="the score policy was fitted with "
+                             "fit_from_clouds --absolute, so its fields "
+                             "predict the plan rather than the update")
     parser.add_argument("--example", default="unitree_go2_trot_csm")
     parser.add_argument("--targets", nargs="+",
                         default=["uniform", "boost0", "boost1", "boost2",
@@ -274,6 +285,12 @@ def main() -> None:
     n_rows = int(np.asarray(env_config.reward_weights).shape[0])
     catalogue = build_omegas(n_rows)
     targets = {}
+    if args.absolute and len(policy.policies) > 1:
+        raise ValueError(
+            f"--absolute with {len(policy.policies)} fields: an absolute plan "
+            "does not compose, so only a single field fitted at the target "
+            "weight can be scored this way"
+        )
     if blob is not None:
         name = blob.get("omega_name") or "rl"
         targets[name] = normalize_omega_np(
@@ -291,7 +308,7 @@ def main() -> None:
         student = make_rl_student(env, inference, args.steps)
     else:
         student = make_student(env, policy, dial_config, args.init_passes,
-                               args.steps)
+                               args.steps, absolute=args.absolute)
     teacher = make_teacher(env, mbdpi, dial_config, args.init_passes,
                            args.std_normalize, args.steps,
                            tuple(args.level_scales))
