@@ -304,6 +304,21 @@ def main() -> None:
                              else normalize_omega_np(
                                  np.array([float(v) for v in name.split(",")])))
 
+    if args.absolute:
+        # The mixture solve still runs, and away from the fitted weight it
+        # returns a coefficient that scales an absolute plan -- a number with
+        # no meaning.  Nothing would crash; the row would just be wrong, so
+        # refuse instead.
+        fitted = np.asarray(policy.mode_weights[0], dtype=float)
+        for name, omega in targets.items():
+            if not np.allclose(np.asarray(omega, dtype=float), fitted, atol=1e-6):
+                raise ValueError(
+                    f"--absolute policy was fitted at "
+                    f"{np.round(fitted, 4).tolist()}; target {name} = "
+                    f"{np.round(omega, 4).tolist()} is a different weight and "
+                    "an absolute plan cannot be composed to reach it"
+                )
+
     if inference is not None:
         student = make_rl_student(env, inference, args.steps)
     else:
