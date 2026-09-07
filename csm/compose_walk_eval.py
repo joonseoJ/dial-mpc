@@ -183,6 +183,39 @@ def make_rl_student(env, inference, n_steps, record=_reward_done):
     return run
 
 
+def make_dial_student(env, dial_config, init_passes, std_normalize, n_steps,
+                      level_scales, overrides):
+    """A DIAL variant scored as a student against the configured DIAL.
+
+    The planner arms -- the published algorithm with its spread normalisation
+    on, and a DIAL cut down until it fits the control period -- are controllers
+    like any other, so they belong in the student slot rather than in a second
+    script that would drift away from this one.  `overrides` is applied to the
+    planner's own config, and `make_controller` is rebuilt from it because
+    `Nsample` and the horizon are baked into the sampler.
+
+    The target weight needs no argument: `set_omega` has already written it
+    into `state.info`, and the environment's reward reads it from there, so a
+    DIAL variant plans for whatever weight the row is about.
+
+    One limitation worth stating. The sampling key is fixed, so the two seeds
+    of a row differ by their initial state but not by the planner's noise.
+    That understates this arm's seed-to-seed spread; it does not bias its mean,
+    and the initial state is where the variation in this grid actually comes
+    from.
+    """
+
+    cfg = dataclasses.replace(dial_config, **overrides)
+    mbdpi = make_controller(cfg, env)
+    run = make_teacher(env, mbdpi, cfg, init_passes, std_normalize, n_steps,
+                       level_scales)
+
+    def student(state, omega, temperature):
+        return run(state, jax.random.PRNGKey(0))
+
+    return student
+
+
 def summarise(reward, done, n_steps):
     """Mean cost over the whole episode, and how long it stayed up.
 
@@ -209,6 +242,21 @@ def main() -> None:
     # quietly report a policy answering a question it was never asked.
     source.add_argument("--rl-policy", type=Path,
                         help="a fixed-weight policy from csm.rl_baseline")
+    source.add_argument("--dial-student", action="store_true",
+                        help="score a DIAL variant against the configured "
+                             "DIAL; combine with --student-samples, "
+                             "--student-diffuse, --student-horizon and "
+                             "--student-std-normalize")
+    parser.add_argument("--student-samples", type=int, default=None)
+    parser.add_argument("--student-diffuse", type=int, default=None)
+    parser.add_argument("--student-horizon", type=int, default=None,
+                        help="Hsample: the rollout length, which is where "
+                             "DIAL's cost actually lives -- the sample count "
+                             "is parallel on a GPU and cutting it 512x buys 6%")
+    parser.add_argument("--student-std-normalize", action="store_true",
+                        help="the published DIAL, which divides sample returns "
+                             "by their own spread; the collection does not, so "
+                             "this is a different controller from the teacher")
     parser.add_argument("--absolute", action="store_true",
                         help="the score policy was fitted with "
                              "fit_from_clouds --absolute, so its fields "
@@ -268,7 +316,10 @@ def main() -> None:
             env_config, track_scale=track, stability_scale=stability,
             gait_scale=gait,
         )
-    if args.rl_policy is not None:
+    if args.dial_student:
+        inference = blob = policy = None
+        temperature = args.temperature or float(dial_config.temp_sample)
+    elif args.rl_policy is not None:
         inference, blob = load_rl_policy(args.rl_policy)
         policy = None
         temperature = args.temperature or float(dial_config.temp_sample)
@@ -304,7 +355,7 @@ def main() -> None:
                              else normalize_omega_np(
                                  np.array([float(v) for v in name.split(",")])))
 
-    if args.absolute:
+    if args.absolute and policy is not None:
         # The mixture solve still runs, and away from the fitted weight it
         # returns a coefficient that scales an absolute plan -- a number with
         # no meaning.  Nothing would crash; the row would just be wrong, so
@@ -319,7 +370,20 @@ def main() -> None:
                     "an absolute plan cannot be composed to reach it"
                 )
 
-    if inference is not None:
+    if args.dial_student:
+        overrides = {}
+        if args.student_samples is not None:
+            overrides["Nsample"] = args.student_samples
+        if args.student_diffuse is not None:
+            overrides["Ndiffuse"] = args.student_diffuse
+        if args.student_horizon is not None:
+            overrides["Hsample"] = args.student_horizon
+        student = make_dial_student(
+            env, dial_config, args.init_passes, args.student_std_normalize,
+            args.steps, tuple(args.level_scales), overrides)
+        print(f"dial student: overrides={overrides or 'none'}  "
+              f"std_normalize={args.student_std_normalize}")
+    elif inference is not None:
         student = make_rl_student(env, inference, args.steps)
     else:
         student = make_student(env, policy, dial_config, args.init_passes,
@@ -345,11 +409,12 @@ def main() -> None:
                              refresh=args.refresh_teacher_cache)
         print(f"teacher cache {cache.dir}")
 
-    print(f"policy {args.rl_policy or args.policy}")
+    print(f"policy {args.rl_policy or args.policy or 'dial-student'}")
     print(f"env {dial_config.env_name}  T={temperature}  "
           f"levels={args.level_scales}  "
           f"row_scales={args.row_scales or 'from config'}  "
-          + ("  arm=rl" if policy is None else
+          + ("  arm=dial" if args.dial_student else
+             "  arm=rl" if policy is None else
              f"  fields={len(policy.policies)}  "
              f"nu={policy.pinv_nu_weights is not None}"))
     horizons = sorted({args.steps, *(args.also_report or [])})

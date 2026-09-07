@@ -92,6 +92,12 @@ def main() -> None:
                    help="sample counts to time DIAL at; the first is the "
                         "configured planner, the rest are the compute-matched "
                         "arms")
+    p.add_argument("--dial-variants", nargs="*", default=[],
+                   help="`Nsample:Ndiffuse:Hsample` triples to time as well. "
+                        "The horizon is the axis that matters: cost is the "
+                        "sequential rollout, Hsample x Ndiffuse physics steps "
+                        "per control step, so this is where a compute-matched "
+                        "DIAL has to give ground")
     p.add_argument("--target", default="uniform")
     p.add_argument("--command", default="box_fast")
     p.add_argument("--n1", type=int, default=20)
@@ -157,6 +163,17 @@ def main() -> None:
             (state, jax.random.PRNGKey(0)), args.n1, args.n2, args.repeats)
         tag = "the planner as configured" if nsample == args.dial_samples[0] else ""
         record(f"DIAL Nsample={nsample}", ms, tag)
+
+    for spec in args.dial_variants:
+        ns, nd, hs = (int(v) for v in spec.split(":"))
+        cfg = dataclasses.replace(dial_config, Nsample=ns, Ndiffuse=nd,
+                                  Hsample=hs)
+        m = make_controller(cfg, env)
+        ms = marginal_ms(
+            lambda n, c=cfg, mm=m: make_teacher(
+                env, mm, c, args.init_passes, False, n, tuple(args.level_scales)),
+            (state, jax.random.PRNGKey(0)), args.n1, args.n2, args.repeats)
+        record(f"DIAL {ns}/{nd}/{hs}", ms, f"{nd * hs} sequential steps")
 
     ms = marginal_ms(
         lambda n: make_student(env, policy, dial_config, args.init_passes, n),
