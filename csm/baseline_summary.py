@@ -31,7 +31,13 @@ ARMS = [
     ("CSM composed", "walk_screen/compose_v5_cached.json", None, 1.38, "6.2 h once, whole cone"),
     ("CSM specialist", "walk_screen/specialist_eval.json", None, 1.38, "51 min per weight"),
     ("PPO", None, None, 1.33, "4.2 min per weight"),
-    ("SAC (10M, unconverged)", None, None, 1.33, "4.8 min per weight"),
+    # Under-tuned rather than invalid.  brax counts one gradient update per
+    # loop step and a step collects `num_envs` transitions, so 1024 envs at
+    # grad_updates_per_step=1 is an update-to-data ratio of ~0.001 against
+    # the ~1 SAC is normally run at.  It still lands within cell noise of
+    # PPO at equal sample budget, which makes this row a lower bound on
+    # model-free RL rather than a verdict on SAC.
+    ("SAC (update ratio 0.001)", None, None, 1.33, "6.3 min per weight"),
 ]
 
 PPO_SLUGS = {"uniform": "uniform", "boost0": "boost0", "boost1": "boost1",
@@ -66,7 +72,12 @@ def gather(root: Path):
         elif name.startswith("SAC"):
             got = []
             for slug in ("uniform", "boost1", "boost2"):
-                got += cells(root / f"sac-sweep/{slug}_eval.json")
+                # The fair-budget runs where they exist; the first sweep gave
+                # SAC a fifth of PPO's samples and is kept only as a budget
+                # curve.
+                fair = root / f"sac-fair/{slug}_eval.json"
+                got += cells(fair if fair.exists()
+                             else root / f"sac-sweep/{slug}_eval.json")
         elif rel is None:
             got = [(1.0, 0)]
         else:
