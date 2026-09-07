@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import time
 from pathlib import Path
 
@@ -36,12 +37,14 @@ import jax.numpy as jnp
 import brax.envs as brax_envs
 from brax import math as brax_math
 
-from dial_mpc.core.dial_core import make_controller
+from dial_mpc.core.dial_core import MBDPI, make_controller
 
 from csm.basis_screen import _load_config, build_omegas
 from csm.dial_lean import make_dial_step, make_lean_update
 from csm.dial_score import ComposedDialScorePolicy, factor_to_t
 from csm.omega import normalize_omega_np
+from csm.rl_baseline import load_policy as load_rl_policy
+from csm.teacher_cache import DEFAULT_ROOT, fingerprint
 from csm.push_recover_eval import make_push_reset, summarise
 
 
@@ -113,8 +116,33 @@ def make_student_episode(env, policy, dial_config, n_steps, init_passes):
     return episode
 
 
+def make_rl_episode(env, inference, n_steps):
+    """A fixed-weight RL policy through the same loop and the same observer.
+
+    Takes the coefficient argument and ignores it: an RL policy has no weight
+    input, which is the comparison's point, so the caller is responsible for
+    asking only about the weight it was trained at.
+    """
+
+    observe = make_observer(env)
+
+    def episode(state, _coefficients):
+        def body(carry, _):
+            st, key = carry
+            key, sub = jax.random.split(key)
+            action, _ = inference(st.obs, sub)
+            st = env.step(st, action)
+            return (st, key), observe(st)
+
+        _, traj = jax.lax.scan(
+            body, (state, jax.random.PRNGKey(0)), None, length=n_steps)
+        return traj
+
+    return episode
+
+
 def make_dial_episode(env, mbdpi, dial_config, n_steps, level_scales,
-                      init_passes: int = 1):
+                      init_passes: int = 1, std_normalize: bool = False):
     """DIAL, given the same head start on its first plan as the student.
 
     The student refines from zero with `init_passes` tiles of the annealing
@@ -126,9 +154,10 @@ def make_dial_episode(env, mbdpi, dial_config, n_steps, level_scales,
 
     observe = make_observer(env)
     control = make_dial_step(
-        env, mbdpi, dial_config, std_normalize=False, level_scales=level_scales
+        env, mbdpi, dial_config, std_normalize=std_normalize,
+        level_scales=level_scales
     )
-    update = make_lean_update(env, mbdpi, dial_config, std_normalize=False)
+    update = make_lean_update(env, mbdpi, dial_config, std_normalize)
     sigma = mbdpi.sigma_control
     factors = dial_config.traj_diffuse_factor ** jnp.arange(dial_config.Ndiffuse)
     scales = jnp.asarray(level_scales, dtype=factors.dtype)
@@ -161,7 +190,24 @@ def make_dial_episode(env, mbdpi, dial_config, n_steps, level_scales,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--policy", type=Path, required=True)
+    arm = parser.add_mutually_exclusive_group(required=True)
+    arm.add_argument("--policy", type=Path,
+                     help="a composed score-field policy")
+    arm.add_argument("--rl-policy", type=Path,
+                     help="a fixed-weight policy from csm.rl_baseline; the "
+                          "target list then comes from the policy, since it "
+                          "has no weight input and can only answer for the "
+                          "weight it was trained at")
+    arm.add_argument("--dial-student", action="store_true",
+                     help="score a DIAL variant against the configured DIAL")
+    parser.add_argument("--student-std-normalize", action="store_true",
+                        help="the published DIAL, which divides sample returns "
+                             "by their own spread")
+    parser.add_argument("--student-samples", type=int, default=None)
+    parser.add_argument("--student-diffuse", type=int, default=None)
+    parser.add_argument("--student-horizon", type=int, default=None,
+                        help="Hsample: where the planner's cost actually is, "
+                             "since the sample count is parallel on a GPU")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--example", type=str, default=None)
     source.add_argument("--config", type=str, default=None)
@@ -180,17 +226,36 @@ def main() -> None:
     parser.add_argument("--chunk", type=int, default=8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=str, default=None)
+    # DIAL does not depend on the arm being scored, so a four-arm table
+    # recomputes one identical sweep four times.  Unlike the walking cache
+    # this stores the whole grid in one file: the sweep is vmapped, so there
+    # are no per-episode boundaries to key on.
+    parser.add_argument("--teacher-cache", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument("--no-teacher-cache", action="store_true")
+    parser.add_argument("--refresh-teacher-cache", action="store_true")
     args = parser.parse_args()
 
     dial_config, env_config = _load_config(args.example, args.config)
     dial_config = dataclasses.replace(dial_config, temp_sample=args.temperature)
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
     mbdpi = make_controller(dial_config, env)
-    policy = ComposedDialScorePolicy.load(args.policy)
+    policy = (ComposedDialScorePolicy.load(args.policy)
+              if args.policy is not None else None)
+    inference = blob = None
+    if args.rl_policy is not None:
+        inference, blob = load_rl_policy(args.rl_policy)
+        name = blob.get("omega_name") or "rl"
+        args.targets = [name]
+        print(f"[eval] rl policy trained at {name} = "
+              f"{np.round(blob['omega'], 4).tolist()}; scoring that weight only")
 
     n_rows = int(np.asarray(env_config.reward_weights).shape[0])
     catalogue = build_omegas(n_rows)
     targets, omegas = [], []
+    if blob is not None:
+        catalogue = dict(catalogue)
+        catalogue[args.targets[0]] = normalize_omega_np(
+            np.asarray(blob["omega"], dtype=float))
     for name in args.targets:
         if name in catalogue:
             omegas.append(np.asarray(catalogue[name]))
@@ -200,12 +265,17 @@ def main() -> None:
             ))
         targets.append(name)
     omega_array = jnp.asarray(np.stack(omegas))
-    coefficients = jnp.stack([
-        policy.coefficients(omega_array[i]) for i in range(len(targets))
-    ])
-    print("[eval] composition coefficients")
-    for name, row in zip(targets, np.asarray(coefficients)):
-        print(f"  {name:<10} {np.round(row, 4)}")
+    if policy is not None:
+        coefficients = jnp.stack([
+            policy.coefficients(omega_array[i]) for i in range(len(targets))
+        ])
+        print("[eval] composition coefficients")
+        for name, row in zip(targets, np.asarray(coefficients)):
+            print(f"  {name:<10} {np.round(row, 4)}")
+    else:
+        # Nothing to solve for an arm with no weight input; the slot still has
+        # to be filled because the grid runner passes it positionally.
+        coefficients = jnp.zeros((len(targets), 1))
 
     speeds = jnp.asarray(args.speeds)
     n_target, n_speed, n_seed = len(targets), len(speeds), args.seeds
@@ -216,9 +286,35 @@ def main() -> None:
     roll_keys = jax.random.split(roll_rng, n_seed)
 
     push_reset = make_push_reset(env)
-    student = make_student_episode(
-        env, policy, dial_config, args.steps, args.init_passes
-    )
+    if args.dial_student:
+        overrides = {}
+        if args.student_samples is not None:
+            overrides["Nsample"] = args.student_samples
+        if args.student_diffuse is not None:
+            overrides["Ndiffuse"] = args.student_diffuse
+        if args.student_horizon is not None:
+            overrides["Hsample"] = args.student_horizon
+        student_config = dataclasses.replace(dial_config, **overrides)
+        levels = tuple(args.level_scales[:student_config.Ndiffuse])
+        if len(levels) != student_config.Ndiffuse:
+            raise ValueError(
+                f"level_scales has {len(args.level_scales)} entries and the "
+                f"student runs {student_config.Ndiffuse} annealing levels; "
+                "one scale per level is required"
+            )
+        student_episode = make_dial_episode(
+            env, make_controller(student_config, env), student_config,
+            args.steps, levels, args.init_passes,
+            std_normalize=args.student_std_normalize)
+        print(f"[eval] dial student: overrides={overrides or 'none'}  "
+              f"std_normalize={args.student_std_normalize}")
+    elif inference is not None:
+        student_episode = make_rl_episode(env, inference, args.steps)
+    else:
+        student_episode = make_student_episode(
+            env, policy, dial_config, args.steps, args.init_passes
+        )
+    student = student_episode
     teacher = make_dial_episode(
         env, mbdpi, dial_config, args.steps, tuple(args.level_scales),
         args.init_passes,
@@ -234,7 +330,11 @@ def main() -> None:
     def run_student(it, is_, id_):
         state = push_reset(reset_keys[id_], speeds[is_], headings[id_],
                            omega_array[it])
-        return summarise(student(state, coefficients[it]), args.step_threshold)
+        # A DIAL variant needs a sampling key rather than mixture
+        # coefficients, and it gets the teacher's so the two differ by the
+        # configuration under test and not by their noise.
+        second = roll_keys[id_] if args.dial_student else coefficients[it]
+        return summarise(student(state, second), args.step_threshold)
 
     def run_teacher(it, is_, id_):
         state = push_reset(reset_keys[id_], speeds[is_], headings[id_],
@@ -259,7 +359,44 @@ def main() -> None:
         return {k: np.asarray(v) for k, v in result.items()}
 
     student_out = sweep(run_student, min(args.chunk * 4, total), "student")
-    teacher_out = sweep(run_teacher, min(args.chunk, total), "DIAL")
+
+    teacher_out = None
+    cache_path = None
+    if not args.no_teacher_cache:
+        digest, manifest = fingerprint(
+            dial_config=dial_config, env_config=env_config, env=env,
+            functions=(make_dial_episode, make_dial_step, make_lean_update,
+                       make_push_reset, summarise, MBDPI, type(mbdpi)),
+            # The grid itself is part of what the stored arrays mean.
+            extra={"targets": [np.asarray(o).round(9).tolist() for o in omegas],
+                   "speeds": [float(v) for v in args.speeds],
+                   "seeds": int(args.seeds), "steps": int(args.steps),
+                   "init_passes": int(args.init_passes),
+                   "level_scales": [float(v) for v in args.level_scales],
+                   "step_threshold": float(args.step_threshold),
+                   "seed": int(args.seed)},
+        )
+        cache_dir = Path(args.teacher_cache) / digest
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = cache_dir / "manifest.json"
+        if not manifest_path.exists():
+            manifest_path.write_text(json.dumps(manifest, indent=2,
+                                                sort_keys=True))
+        cache_path = cache_dir / "push_grid.npz"
+        if cache_path.exists() and not args.refresh_teacher_cache:
+            try:
+                with np.load(cache_path) as stored:
+                    teacher_out = {k: stored[k] for k in stored.files}
+                print(f"[eval] DIAL: reused {cache_path}")
+            except (OSError, ValueError, KeyError):
+                teacher_out = None
+    if teacher_out is None:
+        teacher_out = sweep(run_teacher, min(args.chunk, total), "DIAL")
+        if cache_path is not None:
+            tmp = cache_path.with_name(f"push_grid.{os.getpid()}.tmp.npz")
+            np.savez_compressed(tmp, **teacher_out)
+            os.replace(tmp, cache_path)
+            print(f"[eval] DIAL: wrote {cache_path}")
 
     idx_t, idx_s = np.asarray(flat[0]), np.asarray(flat[1])
 

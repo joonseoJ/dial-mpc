@@ -108,15 +108,22 @@ def main() -> None:
     args = p.parse_args()
 
     dial_config, env_config = _load_config(args.example, None)
-    track, stability, gait = args.row_scales
-    env_config = dataclasses.replace(
-        env_config, track_scale=track, stability_scale=stability, gait_scale=gait)
+    # The row normalisers are named per task -- the walking rows are
+    # track/stability/gait and the stand-and-resist ones are
+    # tilt/base/foot/shape -- so apply them only where they exist and let
+    # every other environment keep the values its config already carries.
+    if args.row_scales and hasattr(env_config, "track_scale"):
+        track, stability, gait = args.row_scales
+        env_config = dataclasses.replace(
+            env_config, track_scale=track, stability_scale=stability,
+            gait_scale=gait)
     policy = ComposedDialScorePolicy.load(args.policy)
     temperature = float(policy.temperature or dial_config.temp_sample)
     dial_config = dataclasses.replace(dial_config, temp_sample=temperature)
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
 
-    omega = build_omegas(int(np.asarray(env_config.reward_weights).shape[0]))[args.target]
+    n_rows = int(np.asarray(env_config.reward_weights).shape[0])
+    omega = build_omegas(n_rows)[args.target]
     state = jax.jit(env.reset)(jax.random.PRNGKey(11))
     state = set_command(env, state, COMMANDS[args.command])
     state = set_omega(state, omega)

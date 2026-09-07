@@ -89,11 +89,19 @@ def build_env(example: str, omega, *, terminate: bool, randomize_start: bool,
         reward_weights=jnp.asarray(omega, dtype=jnp.float32),
         randomize_start_state=bool(randomize_start),
     )
-    if not env_config.randomize_tasks:
+    # The student is conditioned on whatever the task varies, so the baseline
+    # has to see the same variation or it is answering an easier question.
+    # What varies differs by task: the walking environments randomise the
+    # velocity command, and the stand-and-resist one randomises the push at
+    # reset and has no command at all.
+    varies = bool(getattr(env_config, "randomize_tasks", False)) or (
+        float(getattr(env_config, "push_linear_velocity", 0.0)) > 0.0
+    )
+    if not varies:
         raise ValueError(
-            "the student is conditioned on a command, so the baseline has to "
-            "be trained on the same randomised commands or it is answering an "
-            "easier question"
+            "this configuration varies nothing between episodes -- neither a "
+            "randomised command nor a push -- so a baseline trained on it "
+            "would face one fixed problem the student never does"
         )
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
     return (env if terminate else FixedHorizonWrapper(env)), dial_config, env_config
