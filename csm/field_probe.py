@@ -56,6 +56,15 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=12)
     p.add_argument("--init-passes", type=int, default=5)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--from-cloud", type=Path, default=None,
+                   help="a stored shard: compare the field against the label "
+                        "on the cloud's own states, through the deployment "
+                        "call path.  Separates a training/inference mismatch "
+                        "from distribution shift -- the fit already reports a "
+                        "cosine here, so a lower one means the two paths "
+                        "disagree and a matching one means the field is simply "
+                        "being asked to work somewhere it was never fitted.")
+    p.add_argument("--cloud-rows", type=int, default=256)
     args = p.parse_args()
 
     dial_config, env_config = _load_config(args.example, None)
@@ -86,14 +95,41 @@ def main() -> None:
         parts = jnp.stack([f.delta(plan, obs, t) for f in fields])
         return jnp.einsum("k,kij->ij", jnp.asarray(coeff), parts)
 
+    if args.from_cloud is not None:
+        from csm.cloud_data import (load_clouds, make_relabeler,
+                                    query_temperatures)
+        clouds = load_clouds(args.from_cloud)
+        clouds = jax.tree.map(lambda x: x[: args.cloud_rows], clouds)
+        relabel, _ = make_relabeler(mbdpi, dial_config)
+        temps = query_temperatures(clouds, args.temperature,
+                                   tuple(args.level_scales))
+        label, _ = relabel(clouds, jnp.asarray(omega), temps, False, None)
+        t = jax.vmap(lambda f: factor_to_t(f, lo, hi).reshape(1))(clouds.factor)
+        pred = jax.vmap(
+            lambda u, o, tt: jnp.einsum(
+                "k,kij->ij", jnp.asarray(coeff),
+                jnp.stack([f.delta(u, o, tt) for f in fields]),
+            )
+        )(clouds.u, clouds.obs, t)
+        a = np.asarray(pred).reshape(len(pred), -1)
+        b = np.asarray(label).reshape(len(label), -1)
+        na = np.linalg.norm(a, axis=1)
+        nb = np.linalg.norm(b, axis=1)
+        cos = (a * b).sum(1) / np.maximum(na * nb, 1e-12)
+        print(f"on the cloud's own {len(a)} states, through field.delta:")
+        print(f"  |field| {na.mean():.4f}   |label| {nb.mean():.4f}   "
+              f"ratio {np.mean(na / np.maximum(nb, 1e-9)):.2f}")
+        print(f"  cosine mean {cos.mean():.3f}  median {np.median(cos):.3f}")
+        return
+
     if args.command is not None:
         state = jax.jit(env.reset)(jax.random.PRNGKey(11 + args.seed))
         state = set_command(env, state, COMMANDS[args.command])
         state = set_omega(state, omega)
     else:
         state = make_push_reset(env)(jax.random.PRNGKey(args.seed),
-                                     jnp.asarray(args.speed), jnp.asarray(0.3),
-                                     jnp.asarray(omega))
+                                     jnp.asarray(args.speed),
+                                     jnp.asarray(0.3), jnp.asarray(omega))
     plan = jnp.zeros((dial_config.Hnode + 1, int(env.action_size)))
     for _ in range(args.init_passes):
         for factor in factors:
