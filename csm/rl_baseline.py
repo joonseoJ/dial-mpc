@@ -70,6 +70,57 @@ class FixedHorizonWrapper(Wrapper):
         return state.replace(done=jnp.zeros_like(state.done))
 
 
+class OmegaConditionedWrapper(Wrapper):
+    """Sample the objective weight per episode and show it to the policy.
+
+    This is compositional score matching's own claim, made by reinforcement
+    learning instead: train once, serve the whole cone.  Where CSM trains k
+    fields and mixes them linearly, this hands omega to the network and lets it
+    work out the dependence itself.  If it succeeds, the linear composition is
+    machinery nobody needs; if it fails, the reason to build a basis is finally
+    measured rather than assumed.
+
+    The weight is drawn on the unit sphere restricted to the positive orthant
+    -- exponential coordinates rescaled to unit length -- because that is where
+    every evaluation target lives and `normalize_omega` puts the environment's
+    own copy there anyway.  It is written into `info` before the reward is
+    computed and appended to the observation, so the policy is conditioned on
+    exactly the vector it is being scored against.
+
+    `observation_size` has to be overridden: brax resolves it through
+    `self.unwrapped`, which skips every wrapper and would report the
+    environment's own width.
+    """
+
+    def __init__(self, env, n_rows: int):
+        super().__init__(env)
+        self._n_rows = int(n_rows)
+
+    @property
+    def observation_size(self) -> int:
+        return int(self.env.observation_size) + self._n_rows
+
+    def _augment(self, state: State) -> State:
+        return state.replace(
+            obs=jnp.concatenate([state.obs, state.info["reward_weights"]])
+        )
+
+    def reset(self, rng: jax.Array) -> State:
+        rng, weight_rng = jax.random.split(rng)
+        state = self.env.reset(rng)
+        weight = jax.random.exponential(weight_rng, (self._n_rows,))
+        weight = weight / jnp.maximum(jnp.linalg.norm(weight), 1e-8)
+        info = {**state.info, "reward_weights": weight}
+        return self._augment(state.replace(info=info))
+
+    def step(self, state: State, action: jax.Array) -> State:
+        # The environment recomputes the observation from the pipeline state
+        # and never reads the one handed in, so the appended entries do not
+        # need stripping first.  It also writes the normalised weight back into
+        # `info`, so re-reading it here keeps the two copies identical.
+        return self._augment(self.env.step(state, action))
+
+
 def resolve_omega(text: str, n_rows: int) -> np.ndarray:
     catalogue = build_omegas(n_rows)
     if text in catalogue:
@@ -78,7 +129,7 @@ def resolve_omega(text: str, n_rows: int) -> np.ndarray:
 
 
 def build_env(example: str, omega, *, terminate: bool, randomize_start: bool,
-              row_scales=None):
+              row_scales=None, condition_omega: bool = False):
     dial_config, env_config = _load_config(example, None)
     if row_scales:
         env_config = dataclasses.replace(
@@ -104,7 +155,11 @@ def build_env(example: str, omega, *, terminate: bool, randomize_start: bool,
             "would face one fixed problem the student never does"
         )
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
-    return (env if terminate else FixedHorizonWrapper(env)), dial_config, env_config
+    env = env if terminate else FixedHorizonWrapper(env)
+    if condition_omega:
+        n_rows = int(np.asarray(env_config.reward_weights).shape[0])
+        env = OmegaConditionedWrapper(env, n_rows)
+    return env, dial_config, env_config
 
 
 def train(args, env):
@@ -187,7 +242,8 @@ def train(args, env):
 
 
 def save_policy(path: Path, *, algo, hidden, params, obs_size, act_size,
-                omega, omega_name=None, temperature=None):
+                omega, omega_name=None, temperature=None,
+                omega_conditioned=False, n_rows=None):
     """Enough to rebuild the deterministic policy without the trainer.
 
     The parameters alone are not a policy: the observation normaliser's
@@ -204,6 +260,11 @@ def save_policy(path: Path, *, algo, hidden, params, obs_size, act_size,
             # The name as well as the vector, so the evaluation labels the row
             # the way every other arm's table does.
             "omega_name": omega_name,
+            # A conditioned policy answers for any weight in the cone, so the
+            # evaluation must not pin it to one target -- and it needs the
+            # weight appended to the observation exactly as training did.
+            "omega_conditioned": bool(omega_conditioned),
+            "n_rows": None if n_rows is None else int(n_rows),
             "temperature": temperature,
         }, handle)
 
@@ -243,6 +304,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--row-scales", type=float, nargs="+", default=None)
     p.add_argument("--algo", choices=("ppo", "sac"), default="ppo")
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--condition-omega", action="store_true",
+                   help="sample the weight per episode and append it to the "
+                        "observation: one policy for the whole cone, which is "
+                        "the claim the basis exists to support")
     p.add_argument("--terminate", action="store_true",
                    help="keep the environment's fall termination; the naive "
                         "setup, in which falling is the optimal policy")
@@ -290,7 +355,8 @@ def main() -> None:
     omega = resolve_omega(args.omega, n_rows)
     env, dial_config, env_config = build_env(
         args.example, omega, terminate=args.terminate,
-        randomize_start=args.randomize_start, row_scales=args.row_scales)
+        randomize_start=args.randomize_start, row_scales=args.row_scales,
+        condition_omega=args.condition_omega)
 
     print(f"env {dial_config.env_name}  algo {args.algo}  "
           f"omega {args.omega} = {np.round(omega, 4).tolist()}")
@@ -308,7 +374,8 @@ def main() -> None:
                 hidden=tuple(int(v) for v in args.hidden.split(",")),
                 params=params, obs_size=env.observation_size,
                 act_size=env.action_size, omega=omega,
-                omega_name=args.omega)
+                omega_name=None if args.condition_omega else args.omega,
+                omega_conditioned=args.condition_omega, n_rows=n_rows)
     report = {
         "algo": args.algo, "omega_name": args.omega,
         "omega": np.asarray(omega, dtype=float).tolist(),

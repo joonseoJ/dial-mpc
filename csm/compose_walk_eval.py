@@ -157,7 +157,8 @@ def make_teacher(env, mbdpi, dial_config, init_passes, std_normalize,
     return run
 
 
-def make_rl_student(env, inference, n_steps, record=_reward_done):
+def make_rl_student(env, inference, n_steps, record=_reward_done,
+                    append_omega=False):
     """A trained-at-one-weight RL policy, run through the same loop.
 
     Signature-compatible with `make_student` so the scoring path, the cached
@@ -165,6 +166,11 @@ def make_rl_student(env, inference, n_steps, record=_reward_done):
     `temperature` are accepted and ignored: an RL policy has no weight input,
     which is the whole point of the comparison -- it answers for the one weight
     it was trained at and the caller is responsible for asking only that one.
+
+    `append_omega` is the exception, for a policy trained with
+    `--condition-omega`.  That one does have a weight input, so the target is
+    appended to the observation exactly as its training wrapper did, and it can
+    be scored across the whole target list like the composed student.
     """
 
     @jax.jit
@@ -172,7 +178,8 @@ def make_rl_student(env, inference, n_steps, record=_reward_done):
         def body(carry, _):
             st, key = carry
             key, sub = jax.random.split(key)
-            action, _ = inference(st.obs, sub)
+            obs = jnp.concatenate([st.obs, omega]) if append_omega else st.obs
+            action, _ = inference(obs, sub)
             st = env.step(st, action)
             return (st, key), record(st)
 
@@ -342,14 +349,20 @@ def main() -> None:
             "does not compose, so only a single field fitted at the target "
             "weight can be scored this way"
         )
-    if blob is not None:
+    pinned = blob is not None and not blob.get("omega_conditioned")
+    if blob is not None and blob.get("omega_conditioned"):
+        # Conditioned on the weight, so it answers for the whole target list
+        # exactly as the composed student does; nothing to pin, and the target
+        # list is built below like any other arm's.
+        print("rl policy is omega-conditioned; scoring the full target list")
+    if pinned:
         name = blob.get("omega_name") or "rl"
         targets[name] = normalize_omega_np(
             np.asarray(blob["omega"], dtype=float))
         args.targets = [name]
         print(f"rl policy trained at {name} = "
               f"{np.round(targets[name], 4).tolist()}; scoring that weight only")
-    else:
+    if not pinned:
         for name in args.targets:
             targets[name] = (catalogue[name] if name in catalogue
                              else normalize_omega_np(
@@ -384,7 +397,9 @@ def main() -> None:
         print(f"dial student: overrides={overrides or 'none'}  "
               f"std_normalize={args.student_std_normalize}")
     elif inference is not None:
-        student = make_rl_student(env, inference, args.steps)
+        student = make_rl_student(
+            env, inference, args.steps,
+            append_omega=bool(blob.get("omega_conditioned")))
     else:
         student = make_student(env, policy, dial_config, args.init_passes,
                                args.steps, absolute=args.absolute)
