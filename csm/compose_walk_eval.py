@@ -52,7 +52,8 @@ def _identity(state):
 
 
 def make_student(env, policy, dial_config, init_passes, n_steps,
-                 record=_reward_done, transform=_identity, absolute=False):
+                 record=_reward_done, transform=_identity, absolute=False,
+                 conditioned=False):
     """The composed policy's own control loop, mixing solved per target.
 
     `record` picks what each step contributes to the returned trajectory.  The
@@ -65,6 +66,12 @@ def make_student(env, policy, dial_config, init_passes, n_steps,
     base through here.  Anything it does is invisible to the objective only if
     the objective is invariant to it; that is the caller's problem, not this
     loop's.
+
+    `conditioned` is the single-network alternative to a basis: one field that
+    takes the weight as an input, so the target is appended to the observation
+    and there is no mixture to solve.  The rest of the loop is untouched, which
+    is what makes it comparable -- only the representation of the weight
+    dependence differs.
 
     `absolute` switches the refinement from `plan + mix(deltas)` to `mix(plan
     predictions)`, for a field fitted with `fit_from_clouds --absolute`.  That
@@ -94,17 +101,22 @@ def make_student(env, policy, dial_config, init_passes, n_steps,
 
     @jax.jit
     def run(state, omega, temperature):
-        mixture = mixture_from_pinv(omega, temperature, pinv_nu, pinv_mode)
+        if conditioned:
+            mixture = jnp.ones((1,), dtype=jnp.float32)
+            see = lambda st: jnp.concatenate([st.obs, omega])
+        else:
+            mixture = mixture_from_pinv(omega, temperature, pinv_nu, pinv_mode)
+            see = lambda st: st.obs
         plan = refine(
             jnp.zeros((dial_config.Hnode + 1, int(env.action_size))),
-            state.obs, mixture, init_passes,
+            see(state), mixture, init_passes,
         )
 
         def body(carry, _):
             st, pl = carry
             st = env.step(st, pl[0])
             st = transform(st)
-            pl = refine(jnp.einsum("ij,ja->ia", shift, pl), st.obs, mixture, 1)
+            pl = refine(jnp.einsum("ij,ja->ia", shift, pl), see(st), mixture, 1)
             return (st, pl), record(st)
 
         _, out = jax.lax.scan(body, (state, plan), None, length=n_steps)
@@ -264,6 +276,11 @@ def main() -> None:
                         help="the published DIAL, which divides sample returns "
                              "by their own spread; the collection does not, so "
                              "this is a different controller from the teacher")
+    parser.add_argument("--conditioned", action="store_true",
+                        help="the policy is a single field from "
+                             "csm.fit_conditioned that takes the weight as an "
+                             "input; the target is appended to the observation "
+                             "and no mixture is solved")
     parser.add_argument("--absolute", action="store_true",
                         help="the score policy was fitted with "
                              "fit_from_clouds --absolute, so its fields "
@@ -368,6 +385,8 @@ def main() -> None:
                              else normalize_omega_np(
                                  np.array([float(v) for v in name.split(",")])))
 
+    if args.absolute and args.conditioned:
+        raise ValueError("--absolute and --conditioned are different arms")
     if args.absolute and policy is not None:
         # The mixture solve still runs, and away from the fitted weight it
         # returns a coefficient that scales an absolute plan -- a number with
@@ -401,8 +420,14 @@ def main() -> None:
             env, inference, args.steps,
             append_omega=bool(blob.get("omega_conditioned")))
     else:
+        if args.conditioned and len(policy.policies) != 1:
+            raise ValueError(
+                f"--conditioned with {len(policy.policies)} fields: the weight "
+                "is an input to one network here, so there is nothing to mix"
+            )
         student = make_student(env, policy, dial_config, args.init_passes,
-                               args.steps, absolute=args.absolute)
+                               args.steps, absolute=args.absolute,
+                               conditioned=args.conditioned)
     teacher = make_teacher(env, mbdpi, dial_config, args.init_passes,
                            args.std_normalize, args.steps,
                            tuple(args.level_scales))
