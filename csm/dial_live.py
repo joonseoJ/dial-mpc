@@ -371,6 +371,27 @@ class LiveDial:
             if "n_contact" in state.info:
                 body["feet_down"] = round(float(state.info["n_contact"]), 2)
 
+            # Restored: `3f6b9cb` dropped the whole per-step bookkeeping along
+            # with the tasks it was cleaning up, so the viewer built a renderer
+            # it never called and reported an episode that never advanced --
+            # controls but no video, and every counter stuck at its initial
+            # value.
+            episode_reward += reward
+            episode_step += 1
+            step_index += 1
+            rate_steps += 1
+
+            if step_index % self.render_every == 0:
+                self.publish(
+                    renderer.render(state.pipeline_state),
+                    f"t={episode_step * self.control_dt:6.2f}s  cost={-reward:8.3f}",
+                )
+
+            now = time.perf_counter()
+            if now - rate_window >= 1.0:
+                control_hz = rate_steps / (now - rate_window)
+                rate_window, rate_steps = now, 0
+
             omega_np = np.asarray(omega, dtype=float)
             total = float(np.abs(omega_np).sum()) or 1.0
             report = self.weight_report(np.asarray(weights, dtype=np.float64))
@@ -400,13 +421,18 @@ class LiveDial:
                 return_spread=round(float(np.asarray(returns).std()), 4),
             )
 
+            # `--no-reset-on-fall` still counts the fall but keeps the same
+            # episode running.  The environment goes on stepping after `done`,
+            # so the robot can be watched trying to get up or lying on the
+            # floor instead of the view snapping back to a fresh stance.
             if float(state.done) > 0.5:
                 falls += 1
-                history.append(episode_step * self.control_dt)
-                seed += 1
-                state = self._reset_env(jax.random.PRNGKey(seed))
-                plan = jnp.zeros_like(plan)
-                episode_step, episode_reward, fresh = 0, 0.0, True
+                if not self.args.no_reset_on_fall:
+                    history.append(episode_step * self.control_dt)
+                    seed += 1
+                    state = self._reset_env(jax.random.PRNGKey(seed))
+                    plan = jnp.zeros_like(plan)
+                    episode_step, episode_reward, fresh = 0, 0.0, True
 
 
 PAGE = """<!doctype html>
@@ -595,6 +621,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=float, default=20.0)
     parser.add_argument("--quality", type=int, default=80)
     parser.add_argument("--camera", default=None)
+    parser.add_argument("--no-reset-on-fall", action="store_true",
+                        help="never end the episode -- keep stepping "
+                             "through a fall so the physics can be "
+                             "watched recovering or lying there")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--samples", type=int, default=None,
                         help="override Nsample; lower it for a snappier viewer")

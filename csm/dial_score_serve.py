@@ -58,12 +58,44 @@ class FrameRenderer:
         self.model = sys.mj_model
         self.renderer = mujoco.Renderer(self.model, height=height, width=width)
         self.data = mujoco.MjData(self.model)
-        self.camera = camera if camera is not None else -1
+        # A named camera that the scene does not define raises inside
+        # `update_scene`, and it raises on the *first frame* -- in a rollout
+        # thread, where it kills the loop and leaves the page showing controls
+        # with no video.  Fall back to the free camera instead: the H1 scenes
+        # define no cameras at all, and a viewer that works is worth more than
+        # the tracking shot.
+        if isinstance(camera, str):
+            names = {
+                mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_CAMERA, i)
+                for i in range(self.model.ncam)
+            }
+            if camera not in names:
+                print(f"[render] no camera {camera!r} in this model "
+                      f"({sorted(n for n in names if n)} available); "
+                      "tracking the base with a free camera")
+                camera = None
+        # A free camera re-aimed at the base every frame, so a model with no
+        # tracking camera of its own still follows the robot instead of
+        # watching it walk out of shot.
+        self._free = None
+        if camera is None:
+            self._free = mujoco.MjvCamera()
+            mujoco.mjv_defaultFreeCamera(self.model, self._free)
+            self._free.distance = float(height) / 90.0 + 3.0
+            self._free.elevation = -18.0
+            self._free.azimuth = 120.0
+            self.camera = self._free
+        else:
+            self.camera = camera
 
     def render(self, pipeline_state) -> np.ndarray:
         self.data.qpos = np.asarray(pipeline_state.q)
         self.data.qvel = np.asarray(pipeline_state.qd)
         mujoco.mj_forward(self.model, self.data)
+        if self._free is not None:
+            # Keep the look-at point on the floating base (qpos[:3]) so the
+            # shot pans with the robot.
+            self._free.lookat[:] = self.data.qpos[:3]
         self.renderer.update_scene(self.data, camera=self.camera)
         return self.renderer.render()
 
