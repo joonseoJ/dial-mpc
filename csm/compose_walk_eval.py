@@ -53,7 +53,7 @@ def _identity(state):
 
 def make_student(env, policy, dial_config, init_passes, n_steps,
                  record=_reward_done, transform=_identity, absolute=False,
-                 conditioned=False):
+                 conditioned=False, step_passes=1):
     """The composed policy's own control loop, mixing solved per target.
 
     `record` picks what each step contributes to the returned trajectory.  The
@@ -116,7 +116,13 @@ def make_student(env, policy, dial_config, init_passes, n_steps,
             st, pl = carry
             st = env.step(st, pl[0])
             st = transform(st)
-            pl = refine(jnp.einsum("ij,ja->ia", shift, pl), see(st), mixture, 1)
+            # step_passes>1 re-anneals the shifted plan several times per
+            # control step, the way DIAL keeps re-solving instead of trusting
+            # one pass -- a distilled field left to run open-loop drifts, and
+            # more refinement per step is the cheapest correction to try before
+            # re-collecting.
+            pl = refine(jnp.einsum("ij,ja->ia", shift, pl), see(st),
+                        mixture, step_passes)
             return (st, pl), record(st)
 
         _, out = jax.lax.scan(body, (state, plan), None, length=n_steps)
