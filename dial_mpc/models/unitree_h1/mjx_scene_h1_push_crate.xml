@@ -22,7 +22,7 @@
     <geom name="floor" size="0 0 0.05" type="plane" contype="2" conaffinity="1" material="groundplane"/>
 
     <body name="box_body" pos="0 0 0.6">
-      <geom name="static_box" type="box" contype="4" conaffinity="1" size="0.6 0.6 0.6" friction="0.5" material="box_material" rgba="0.87 0.72 0.53 0.0"/>
+      <geom name="static_box" type="box" contype="4" conaffinity="1" size="0.6 0.6 0.6" friction="0.5" material="box_material" rgba="0.87 0.72 0.53 1.0"/>
       <inertial mass="30.0" pos="0 0 0" diaginertia="0.1 0.1 0.1" />
       <joint type="slide" axis="1 0 0" frictionloss="50.0"/>
     </body>

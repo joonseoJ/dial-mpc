@@ -20,6 +20,7 @@ from mujoco import mjx
 from dial_mpc.envs.base_env import BaseEnv, BaseEnvConfig
 from dial_mpc.utils.function_utils import global_to_body_velocity, get_foot_step
 from dial_mpc.utils.io_utils import get_model_path
+from csm.omega import normalize_omega
 
 
 @dataclass
@@ -375,8 +376,20 @@ class UnitreeH1WalkEnv(BaseEnv):
         return new_lin_vel_cmd, new_ang_vel_cmd
 
 
+@dataclass
 class UnitreeH1PushCrateEnvConfig(UnitreeH1WalkEnvConfig):
-    pass
+    # Eight rows with a live coefficient in the shipped reward, folded in so a
+    # uniform weight reproduces the original controller up to unit
+    # normalisation.  air_time, pos and alive shipped at zero and are dropped:
+    # a row contributing nothing cannot be discriminated and makes the basis
+    # rank deficient.  The base config had no @dataclass, so it inherited its
+    # parent's fields unchanged and a new field here was silently ignored.
+    # A ninth row was added for pushing the crate.
+    reward_weights: jax.Array = field(default_factory=lambda: jnp.ones(9))
+    # How far to push the crate along +x from where it starts.  It is a 30 kg
+    # slide body with 50 N frictionloss, so this is a genuine manipulation
+    # term, not a locomotion one.
+    crate_push_distance: float = 2.0
 
 
 class UnitreeH1PushCrateEnv(UnitreeH1WalkEnv):
@@ -407,6 +420,9 @@ class UnitreeH1PushCrateEnv(UnitreeH1WalkEnv):
             "randomize_target": self._config.randomize_tasks,
             "last_contact": jnp.zeros(2, dtype=jnp.bool),
             "feet_air_time": jnp.zeros(2),
+            "reward_weights": normalize_omega(self._config.reward_weights),
+            "crate_tar": pipeline_state.qpos[-1] + self._config.crate_push_distance,
+            "reward_terms": jnp.zeros(9),
         }
 
         obs = self._get_obs(pipeline_state, state_info)
@@ -528,20 +544,31 @@ class UnitreeH1PushCrateEnv(UnitreeH1WalkEnv):
         # stay alive reward
         reward_alive = 1.0 - state.done
         # reward
-        reward = (
-            reward_gaits * 5.0
-            + reward_air_time * 0.0
-            + reward_pos * 0.0
-            + reward_upright * 0.01
-            + reward_yaw * 0.1
-            # + reward_pose * 0.0
-            + reward_vel * 1.0
-            + reward_ang_vel * 1.0
-            + reward_height * 0.5
-            + reward_energy * 0.01
-            + reward_contact * 0.05
-            + reward_alive * 0.0
+        # The crate is the last slide joint: qpos[-1] is its x position.  The
+        # objective is to drive it to a target x, which needs the robot to walk
+        # into it and keep contact -- exactly the look-ahead a sampling planner
+        # does well and reactive RL does badly.
+        crate_x = pipeline_state.qpos[-1]
+        # Normalised by the push distance so the row starts near -1 like the
+        # others rather than at -4, which let a uniform weight care about
+        # nothing but the crate and walk the robot straight into a fall.
+        crate_err = (crate_x - state.info["crate_tar"]) / self._config.crate_push_distance
+        reward_crate = -(crate_err ** 2)
+        reward_components = jnp.stack(
+            [
+                reward_gaits * 5.0,
+                reward_upright * 0.01,
+                reward_yaw * 0.1,
+                reward_vel * 1.0,
+                reward_ang_vel * 1.0,
+                reward_height * 0.5,
+                reward_energy * 0.01,
+                reward_contact * 0.05,
+                reward_crate * 0.5,
+            ]
         )
+        weights = normalize_omega(state.info["reward_weights"])
+        reward = jnp.dot(weights, reward_components)
 
         # done
         up = jnp.array([0.0, 0.0, 1.0])
@@ -560,6 +587,8 @@ class UnitreeH1PushCrateEnv(UnitreeH1WalkEnv):
         state.info["z_feet_tar"] = z_feet_tar
         state.info["feet_air_time"] *= ~contact_filt_mm
         state.info["last_contact"] = contact
+        state.info["reward_weights"] = weights
+        state.info["reward_terms"] = reward_components
 
         state = state.replace(
             pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
@@ -569,6 +598,12 @@ class UnitreeH1PushCrateEnv(UnitreeH1WalkEnv):
 
 @dataclass
 class UnitreeH1LocoEnvConfig(BaseEnvConfig):
+    # Eight rows, in the order the reward used to sum them.  The shipped fixed
+    # coefficients are folded into the rows themselves, so a uniform weight
+    # reproduces the original controller up to the unit-normalisation constant
+    # -- the convention the Go2 bases use, and what lets a weight vector mean
+    # "how much of each" rather than "on what scale".
+    reward_weights: jax.Array = field(default_factory=lambda: jnp.ones(8))
     kp: Union[float, jax.Array] = field(default_factory=lambda: jnp.array(
         [
             200.0,
@@ -689,6 +724,11 @@ class UnitreeH1LocoEnv(BaseEnv):
             "randomize_target": self._config.randomize_tasks,
             "last_contact": jnp.zeros(2, dtype=jnp.bool),
             "feet_air_time": jnp.zeros(2),
+            # Normalised on the way in, so this copy and the one the step
+            # writes back agree from the first control step rather than
+            # after the first update.
+            "reward_weights": normalize_omega(self._config.reward_weights),
+            "reward_terms": jnp.zeros(8),
         }
 
         obs = self._get_obs(pipeline_state, state_info)
@@ -809,20 +849,25 @@ class UnitreeH1LocoEnv(BaseEnv):
         # stay alive reward
         reward_alive = 1.0 - state.done
         # reward
-        reward = (
-            reward_gaits * 10.0
-            + reward_air_time * 0.0
-            + reward_pos * 0.0
-            + reward_upright * 0.5
-            + reward_yaw * 0.5
-            # + reward_pose * 0.0
-            + reward_vel * 1.0
-            + reward_ang_vel * 1.0
-            + reward_height * 0.5
-            + reward_foot_level * 0.02
-            + reward_energy * 0.01
-            + reward_alive * 0.0
+        # The three rows the shipped controller weighted at zero -- air time,
+        # base position and the alive bonus -- are dropped rather than carried
+        # as zeros: a row contributing nothing cannot be told apart from any
+        # other, and a basis built on one is rank deficient by construction.
+        reward_components = jnp.stack(
+            [
+                reward_gaits * 10.0,
+                reward_upright * 0.5,
+                reward_yaw * 0.5,
+                reward_vel * 1.0,
+                reward_ang_vel * 1.0,
+                reward_height * 0.5,
+                reward_foot_level * 0.02,
+                reward_energy * 0.01,
+            ]
         )
+        # omega carries direction only, so the temperature is the sole scale.
+        weights = normalize_omega(state.info["reward_weights"])
+        reward = jnp.dot(weights, reward_components)
 
         # done
         up = jnp.array([0.0, 0.0, 1.0])
@@ -837,6 +882,8 @@ class UnitreeH1LocoEnv(BaseEnv):
         # state management
         state.info["step"] += 1
         state.info["rng"] = rng
+        state.info["reward_weights"] = weights
+        state.info["reward_terms"] = reward_components
         state.info["z_feet"] = z_feet
         state.info["z_feet_tar"] = z_feet_tar
         state.info["feet_air_time"] *= ~contact_filt_mm
