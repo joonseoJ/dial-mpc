@@ -68,9 +68,27 @@ class UnitreeGo2GaitEnvConfig(UnitreeGo2EnvConfig):
     gait_amplitude: float = 0.08
     # How strongly each row insists on the robot standing (common to all rows).
     posture_floor: float = 0.3
-    # How strongly each row insists on tracking the forward command.
-    track_floor: float = 0.3
-    gait_scale: float = 1.0
+    # How strongly each row insists on tracking the forward command, and how
+    # much the pattern term is divided by (smaller divisor = stronger gait).
+    #
+    # These two decide whether the objective is a gait objective at all.  DIAL
+    # selects samples by softmax over their returns, so a row only steers the
+    # plan as far as it moves a sample's return: at the original 0.3/1.0 the
+    # gait term shifted a return by ~7% of its spread, the softmax picked on
+    # posture alone, and DIAL dragged its feet -- max foot lift ~0 against a
+    # 0.08 m target, no contact pattern at all, at a third of the commanded
+    # speed.  Every field distilled from those labels inherited it.
+    #
+    # Chosen by measurement (csm_runs/gait_pick.py, 3 seeds x 3 commands, raw
+    # Gibbs at T=0.1, the convention the labels actually use).  Strengthening
+    # the gait term alone works but trades away the command and then stability
+    # -- x1.0 at track 0.3 walks every gait yet falls 18 times and tracks at
+    # 0.59.  Raising the tracking floor with it recovers both, which is not the
+    # trade-off it looks like: the floor is what keeps the robot moving
+    # underneath the pattern.  At 0.6/0.2 all four gaits come out at 0.90-0.91
+    # with zero falls and 0.63-0.85 of the commanded speed.
+    track_floor: float = 0.6
+    gait_scale: float = 0.2
 
 
 class UnitreeGo2GaitEnv(UnitreeGo2Env):
@@ -120,7 +138,14 @@ class UnitreeGo2GaitEnv(UnitreeGo2Env):
         state.info["vel_tar"] = state.info["vel_cmd"] * command_scale
         state.info["ang_vel_tar"] = state.info["ang_vel_cmd"] * command_scale
 
-        z_feet = pipeline_state.site_xpos[self._feet_site_id][:, 2]
+        # Clearance above the floor, not the raw site height.  `get_foot_step`
+        # returns 0 for a foot in stance, but a foot resting on the ground has
+        # its site one radius up, so comparing the two without subtracting the
+        # radius charged every stance foot a constant (0.0175/0.05)**2 = 0.12
+        # and spent part of the gait row's range on an offset.  The contact test
+        # below already subtracted it; now both agree.
+        z_feet = (pipeline_state.site_xpos[self._feet_site_id][:, 2]
+                  - self._foot_radius)
         t = state.info["step"] * self.dt
         # one target height profile per gait, all at the shared cadence/amp
         def one_gait(phases):
@@ -158,8 +183,7 @@ class UnitreeGo2GaitEnv(UnitreeGo2Env):
         done = done.astype(jnp.float32)
 
         # contact bookkeeping the observation helper reads
-        foot_contact_z = z_feet - self._foot_radius
-        contact = foot_contact_z < 1e-3
+        contact = z_feet < 1e-3
         contact_filt = contact | state.info["last_contact"]
 
         state.info["step"] += 1

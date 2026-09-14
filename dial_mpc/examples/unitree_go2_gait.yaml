@@ -37,4 +37,12 @@ reward_weights:
 - 1
 - 1
 - 1
-gait_scale: 1.551
+# The objective, stated here in full so it cannot disagree with the dataclass
+# defaults -- gait_scale used to be set only here (1.551, a x0.064 pattern term)
+# while the floors were only in the env, and that split is how an objective the
+# planner could not walk went unnoticed.  Chosen by csm_runs/gait_pick.py over
+# 3 seeds x 3 commands: all four gaits at 0.90-0.91, zero falls, 0.63-0.85 of
+# the commanded speed.
+gait_scale: 0.2
+track_floor: 0.6
+posture_floor: 0.3
