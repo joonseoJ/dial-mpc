@@ -85,9 +85,10 @@ class UnitreeGo2GaitEnvConfig(UnitreeGo2EnvConfig):
     # -- x1.0 at track 0.3 walks every gait yet falls 18 times and tracks at
     # 0.59.  Raising the tracking floor with it recovers both, which is not the
     # trade-off it looks like: the floor is what keeps the robot moving
-    # underneath the pattern.  At 0.6/0.2 all four gaits come out at 0.90-0.91
-    # with zero falls and 0.63-0.85 of the commanded speed.
-    track_floor: float = 0.6
+    # underneath the pattern.  Tracking saturates around track 2.0-2.5; at
+    # 2.5/0.2 all four gaits come out at 0.87-0.88 with zero falls and 0.91-0.98
+    # of the commanded speed, measured after the 50-step command ramp.
+    track_floor: float = 2.5
     gait_scale: float = 0.2
 
 
