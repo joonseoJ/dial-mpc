@@ -90,6 +90,11 @@ class UnitreeGo2GaitEnvConfig(UnitreeGo2EnvConfig):
     # of the commanded speed, measured after the 50-step command ramp.
     track_floor: float = 2.5
     gait_scale: float = 0.2
+    # Heading's share of the tracking floor.  The parent env measured 0.3 for
+    # the same expression; it is a knob here because this objective's floor
+    # carries a different scale (track_floor 2.5) and the balance has to be
+    # re-measured whenever the objective moves.
+    yaw_weight: float = 0.6
 
 
 class UnitreeGo2GaitEnv(UnitreeGo2Env):
@@ -169,8 +174,26 @@ class UnitreeGo2GaitEnv(UnitreeGo2Env):
             xd.vel[self._torso_idx - 1], x.rot[self._torso_idx - 1]
         )
         reward_vel = -jnp.sum((vb[:2] - state.info["vel_tar"][:2]) ** 2)
+        # Heading, the term this objective was missing.  Without it nothing in
+        # the reward mentioned which way the robot points: DIAL stayed roughly
+        # straight only by the symmetry of its sample cloud, and the distilled
+        # fields, having no such symmetry, each turned a different way -- walk
+        # +0.34 rad/s, pace -0.24, on a command of exactly zero yaw.  It also
+        # made `ang_vel_tar` -- and so the vyaw command and the viewer's yaw
+        # slider -- dead weight.
+        #
+        # Wrapped error against a target that advances at the commanded rate,
+        # so this one term follows a turn command as well as holding a straight
+        # line; it is the integral of the rate error.  Deliberately no separate
+        # yaw-*rate* term: the parent env measured that carrying both makes the
+        # rows collinear (elite-set overlap 0.006 -> 0.052) and broke turning
+        # commands specifically, 12 failures of 16 against 2 of 48 elsewhere.
+        yaw = math.quat_to_euler(x.rot[self._torso_idx - 1])[2]
+        d_yaw = yaw - state.info["yaw_tar"]
+        reward_yaw = -jnp.square(jnp.atan2(jnp.sin(d_yaw), jnp.cos(d_yaw)))
         floor = (self._config.posture_floor * (reward_upright * 0.5 + reward_height)
-                 + self._config.track_floor * reward_vel)
+                 + self._config.track_floor
+                 * (reward_vel + reward_yaw * self._config.yaw_weight))
 
         reward_components = (
             floor + gait_rows * 0.1 / self._config.gait_scale
@@ -188,6 +211,14 @@ class UnitreeGo2GaitEnv(UnitreeGo2Env):
         contact_filt = contact | state.info["last_contact"]
 
         state.info["step"] += 1
+        # Carry the heading target forward at the commanded rate.  The parent
+        # does this; this env did not, so `yaw_tar` sat at its reset value of 0
+        # while the robot turned -- which both froze the reward above and fed
+        # the observation a yaw error that grew without bound, a value no label
+        # ever depended on.
+        state.info["yaw_tar"] = (
+            state.info["yaw_tar"] + state.info["ang_vel_tar"][2] * self.dt
+        )
         state.info["rng"] = rng
         state.info["z_feet"] = z_feet
         state.info["z_feet_tar"] = z_tar[GAIT_NAMES.index("trot")]
