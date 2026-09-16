@@ -49,6 +49,11 @@ class ContrastField:
 
     base: DialScorePolicy
     residual: DialScorePolicy
+    # The residual is fitted with its targets scaled up by `gain` so all five
+    # networks train on targets of one size (the residual is ~1/3 of the mean
+    # update and an unnormalised MSE would otherwise weight it by ~1/9); the
+    # same factor comes off again here, so the sum is the original label.
+    gain: float = 1.0
 
     @property
     def factors(self) -> jax.Array:
@@ -67,7 +72,8 @@ class ContrastField:
         return self.base.level_scales
 
     def delta(self, plan: jax.Array, obs: jax.Array, t: jax.Array) -> jax.Array:
-        return self.base.delta(plan, obs, t) + self.residual.delta(plan, obs, t)
+        return (self.base.delta(plan, obs, t)
+                + self.residual.delta(plan, obs, t) / self.gain)
 
     def save(self, path: str | Path) -> None:
         with open(path, "wb") as stream:
