@@ -55,7 +55,8 @@ from csm.omega import mixture_from_pinv, normalize_omega, normalize_omega_np
 from PIL import Image
 
 
-def make_student_step(env, policy, dial_config, init_passes: int):
+def make_student_step(env, policy, dial_config, init_passes: int,
+                      step_passes: int = 1):
     """One control step of the composed policy, with its mixing exposed.
 
     Two jitted entry points rather than a traced branch: the first control step
@@ -108,7 +109,10 @@ def make_student_step(env, policy, dial_config, init_passes: int):
 
         return run
 
-    return build(init_passes), build(1)
+    # Every later step tiles the schedule `step_passes` times -- the gait
+    # policies were verified at 6, and a viewer running them at 1 would be
+    # showing a different controller than the one that was measured.
+    return build(init_passes), build(step_passes)
 
 
 class LiveComposed:
@@ -131,7 +135,7 @@ class LiveComposed:
 
         self._first, self._later = make_student_step(
             self.env, self.policy, dial_config, args.init_passes
-        )
+        , step_passes=int(getattr(args, 'step_passes', 1)))
         self._reset = jax.jit(self.env.reset)
 
         @jax.jit
@@ -363,6 +367,12 @@ class LiveComposed:
         # cycle gives +0.262 to +0.328, and the band is published alongside so
         # the swing stays visible rather than hidden.
         window = collections.deque(maxlen=int(round(1.0 / 2.0 / self.control_dt)))
+        # Three seconds of foot contacts (six gait cycles at 2 Hz): enough to
+        # read the pairing off a diagram and to correlate it.
+        gait_hist = collections.deque(maxlen=150)
+        feet = getattr(self.env, '_feet_site_id', None)
+        foot_radius = float(getattr(self.env, '_foot_radius', 0.0))
+        torso = int(getattr(self.env, '_torso_idx', 1)) - 1
         fresh = True
         period = 1.0 / (1.0 / self.control_dt)
         deadline = time.perf_counter()
@@ -388,6 +398,7 @@ class LiveComposed:
                 episode_step, episode_cost, dial_cost, fresh = 0, 0.0, 0.0, True
                 dial_fresh = True
                 window.clear()
+                gait_hist.clear()
 
             state.info["reward_weights"] = omega
             if self.has_command:
@@ -408,6 +419,11 @@ class LiveComposed:
                 dial_state, rng, dial_plan = self._dial(dial_state, rng, dial_plan)
                 dial_cost += -float(dial_state.reward)
 
+            if feet is not None:
+                ps = state.pipeline_state
+                zf = np.asarray(ps.site_xpos[feet][:, 2]) - foot_radius
+                gait_hist.append((zf < 0.02).astype(np.float32).tolist()
+                                 + [float(ps.x.pos[torso, 2])])
             cost = -float(state.reward)
             # Not every environment publishes per-row rewards; the viewer
             # should still run on the ones that do not.
@@ -479,6 +495,19 @@ class LiveComposed:
                 realtime=round(control_hz * self.control_dt, 3),
                 seed=seed,
             )
+            if gait_hist:
+                g = np.asarray(gait_hist)
+                c = g[:, :4]
+                def cor(i, j):
+                    if len(c) < 40 or c[:, i].std() < 1e-6 or c[:, j].std() < 1e-6:
+                        return None
+                    return round(float(np.corrcoef(c[:, i], c[:, j])[0, 1]), 2)
+                pair = lambda a, b, d, e: (None if cor(a, b) is None and cor(d, e) is None
+                                           else round(float(np.nanmean([x for x in (cor(a, b), cor(d, e)) if x is not None])), 2))
+                self.stats['gait_contacts'] = c.astype(int).tolist()
+                self.stats['gait_corr'] = [pair(0, 3, 1, 2), pair(0, 2, 1, 3), pair(0, 1, 2, 3)]
+                self.stats['torso_z'] = round(float(g[-1, 4]), 3)
+                self.stats['duty'] = round(float(c.mean()), 2)
             if self.with_dial:
                 self.stats["dial_mean_cost"] = round(
                     dial_cost / max(episode_step, 1), 4
@@ -506,6 +535,7 @@ class LiveComposed:
                 episode_step, episode_cost, dial_cost, fresh = 0, 0.0, 0.0, True
                 dial_fresh = True
                 window.clear()
+                gait_hist.clear()
 
             if args.realtime and not self.with_dial:
                 deadline += period
@@ -610,6 +640,16 @@ PAGE = """<!doctype html>
     보행 진동에 묻혀 읽을 수 없어(선회 0.3 rad/s 명령에서 순간값이 −0.48~+1.24를
     오갑니다) 평균을 표시합니다. 오차가 크면 막대가 주황으로 바뀝니다.</div>
   </div>
+  <div class="card" id="gaitcard" style="display:none">
+   <h2>발 패턴</h2>
+   <canvas id="gait" width="380" height="104" style="width:100%;background:#0e1116;border:1px solid #2b323e"></canvas>
+   <div class="mix" id="gcorr" style="margin-top:10px"></div>
+   <table><tbody id="gstats"></tbody></table>
+   <div class="hint">가로가 시간(최근 3초 = 보행 주기 6개), 밝은 칸이 접지입니다.
+    막대는 발 쌍의 접지 상관: <b>대각</b>(FL·RR, FR·RL)이 높으면 trot,
+    <b>측면</b>(FL·RL, FR·RR)이 높으면 pace, <b>앞/뒤</b>(FL·FR, RL·RR)가 높으면 bound,
+    셋 다 음수면 4박자 walk입니다.</div>
+  </div>
   <div class="card">
    <h2>보상 가중치 ω</h2>
    <div id="omega"></div>
@@ -656,7 +696,9 @@ function buildOmega(names,values){
     <span class="num" id="wv${i}">${(+values[i]).toFixed(2)}</span></div>`).join('');
   const sets={'균등':names.map(()=>1)};
   names.forEach((n,i)=>sets['boost '+n]=names.map((_,j)=>j===i?3:1));
-  sets['(2,1,1,1)']=[2,1,1,1]; sets['(1,2,2,1)']=[1,2,2,1];
+  names.forEach((n,i)=>sets['only '+n]=names.map((_,j)=>j===i?1:0));
+  for(let i=0;i<names.length;i++)for(let j=i+1;j<names.length;j++)
+    sets[names[i]+'+'+names[j]]=names.map((_,k)=>(k===i||k===j)?1:0);
   presets.innerHTML=Object.keys(sets).map(k=>
     `<button onclick='setOmega(${JSON.stringify(sets[k])})'>${k}</button>`).join('');
 }
@@ -720,6 +762,29 @@ function drawTracking(v,c,band){
       <span>${v[i].toFixed(2)} <span class="err">/ ${c[i].toFixed(2)}</span></span>
       </div>`}).join('');
 }
+const FEET=['FL','FR','RL','RR'], GC=[['대각 (trot)'],['측면 (pace)'],['앞/뒤 (bound)']];
+function drawGait(s){
+  if(!s.gait_contacts)return; gaitcard.style.display='';
+  const cv=document.getElementById('gait'), ctx=cv.getContext('2d');
+  const W=cv.width,H=cv.height,n=150,rows=4,rh=H/rows,cw=W/n;
+  ctx.fillStyle='#0e1116';ctx.fillRect(0,0,W,H);
+  const c=s.gait_contacts, off=n-c.length;
+  for(let r=0;r<rows;r++){
+    ctx.fillStyle='#1a202a';ctx.fillRect(0,r*rh,W,rh-1);
+    ctx.fillStyle='#5b9dd9';
+    for(let t=0;t<c.length;t++)if(c[t][r])ctx.fillRect((off+t)*cw,r*rh+2,Math.ceil(cw),rh-5);
+    ctx.fillStyle='#8d99a9';ctx.font='11px ui-monospace,monospace';ctx.fillText(FEET[r],4,r*rh+rh*0.68);
+  }
+  const g=s.gait_corr||[];
+  gcorr.innerHTML=GC.map(([n],i)=>{const v=g[i];const w=v==null?0:Math.abs(v)*50,left=v<0?50-w:50;
+    return `<div class="mixrow"><span>${n}</span><div class="bar">
+      <i class="${v<0?'neg':''}" style="left:${left}%;width:${w}%"></i></div>
+      <span>${v==null?'–':v.toFixed(2)}</span></div>`}).join('');
+  let read='–';
+  if(g.every(v=>v!=null)){const m=Math.max(...g);
+    read=m<0.15?(g.every(v=>v<0)?'walk (4박자)':'불명확'):['trot','pace','bound'][g.indexOf(m)]+(m<0.5?' (약함)':'')}
+  rows(gstats,[['읽히는 걸음',read],['몸통 높이',s.torso_z+' m'],['접지 비율',s.duty]]);
+}
 function applyTemp(log){const t=Math.pow(10,+log);tempv.textContent=t.toFixed(4);
   post('/controls',{temperature:t})}
 
@@ -731,6 +796,7 @@ async function tick(){
   if(s.has_command && !document.getElementById('c0'))
     buildCommand(s.command_box,s.command);
   drawTracking(s.velocity,s.velocity_target,s.velocity_band);
+  drawGait(s);
   if(tempv.textContent==='–'){temp.value=Math.log10(s.temperature);
     tempv.textContent=s.temperature.toFixed(4);
     tfit.textContent='T = '+s.fit_temperature}
@@ -779,6 +845,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera", default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--init-passes", type=int, default=5)
+    parser.add_argument("--step-passes", type=int, default=1,
+                        help="refinement passes per control step after the "
+                             "first; the gait policies were verified at 6")
     parser.add_argument("--temperature", type=float, default=0.25)
     parser.add_argument("--level-scales", type=float, nargs="+",
                         default=[3.175, 1.0])
@@ -801,6 +870,7 @@ def main() -> None:
     names = {
         "unitree_go2_push_recover": ["tilt", "base", "feet", "shape"],
         "unitree_go2_trot": ["tracking", "stability", "gait"],
+        "unitree_go2_gait": ["walk", "trot", "pace", "bound"],
     }
     if args.row_names is None:
         key = args.example or (str(args.config) if args.config else "")
@@ -824,7 +894,15 @@ def main() -> None:
 
     @app.get("/stats")
     def stats():
-        return jsonify(live.stats)
+        # The run thread rewrites this dict fifty times a second; serialising
+        # it directly can hit "dictionary changed size during iteration" and
+        # hand the page an empty 500.  Snapshot first, retry the rare collision.
+        for _ in range(5):
+            try:
+                return jsonify(dict(live.stats))
+            except RuntimeError:
+                time.sleep(0.005)
+        return jsonify(dict(live.stats))
 
     @app.post("/controls")
     def controls():
