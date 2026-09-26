@@ -34,6 +34,7 @@ https://github.com/user-attachments/assets/f2e5f26d-69ac-4478-872e-26943821a218
 ## Table of Contents
 
 1. [Install](#install-dial-mpc)
+   - [Pretrained Go2 CSM models](#pretrained-go2-csm-models)
 2. [Synchronous Simulation](#synchronous-simulation)
 3. [Asynchronous Simulation](#asynchronous-simulation)
 4. [Deploy in Real](#deploy-in-real-unitree-go2)
@@ -92,6 +93,82 @@ path remains the default.  See
 implementation mapping.
 
 After rollout completes, go to `127.0.0.1:5000` to visualize the rollouts.
+
+## Pretrained Go2 CSM Models
+
+The final compositional score-matching models for the three Go2 tasks are
+published as the [`models-v1`](https://github.com/joonseoJ/dial-mpc/releases/tag/models-v1)
+release.
+
+| Task | Archive | Run directory | Report |
+|---|---|---|---|
+| Push recovery | `go2_push_recovery.zip` | `pr-v2-fit/clouds-fit-20260908-202201` | [`docs/push_recovery_report_ko.md`](docs/push_recovery_report_ko.md), [`docs/push_recovery_baselines_ko.md`](docs/push_recovery_baselines_ko.md) |
+| Walking | `go2_walking.zip` | `clouds-fit-20260905-083613` | [`docs/walking_report_ko.md`](docs/walking_report_ko.md) |
+| Gait styles | `go2_gait.zip` | `gait-fit-d1/clouds-fit-20260915-115906` | [`docs/gait_report_ko.md`](docs/gait_report_ko.md) |
+
+`policy.pkl` is a cloudpickle that resolves its classes against the code it is
+loaded under, so use the models with the code at the `models-v1` tag.  A later
+change to `csm/dial_score.py`, `csm/omega.py` or `_get_obs` can make them load
+and silently misbehave.
+
+### Download
+
+A CUDA 12 GPU is required.
+
+```bash
+git clone --branch models-v1 https://github.com/joonseoJ/dial-mpc.git && cd dial-mpc
+uv venv -p 3.10 && source .venv/bin/activate && uv pip install -e .
+mkdir -p csm_runs && cd csm_runs
+for f in go2_push_recovery go2_walking go2_gait; do
+  wget -q https://github.com/joonseoJ/dial-mpc/releases/download/models-v1/$f.zip
+done
+wget -q https://github.com/joonseoJ/dial-mpc/releases/download/models-v1/SHA256SUMS
+sha256sum -c SHA256SUMS && for f in *.zip; do unzip -q $f; done
+cd ..
+```
+
+### Verify
+
+Each command is a subset of the evaluation in the corresponding report.  The
+expected values were reproduced on a fresh clone with MuJoCo 3.11 and 3.14;
+student numbers vary by up to about 1% between runs (GPU nondeterminism), and
+the DIAL teacher numbers are identical.
+
+```bash
+# Push recovery: cost ratio to DIAL, 4 push speeds x 8 seeds (a few minutes)
+python -m csm.compose_eval --example unitree_go2_push_recover \
+  --policy csm_runs/pr-v2-fit/clouds-fit-20260908-202201/policy.pkl \
+  --targets boost0 uniform 1,2,2,1 --seeds 8
+# expected: ratio 1.188 / 1.134 / 1.124, fall rate 0 everywhere
+
+# Walking: 30 s (1500 steps), 4 commands x 2 seeds (about 30 min, mostly DIAL)
+python -m csm.compose_walk_eval \
+  --policy csm_runs/clouds-fit-20260905-083613/policy.pkl --targets uniform \
+  --commands box_fast,box_slow,box_turn,box_strafe --seeds 2 --steps 1500 \
+  --row-scales 2.479 0.261 1.551 --level-scales 2.625 1.0 --no-teacher-cache
+# expected: ratio 1.229 / 1.52 / 2.42 / 1.17, student and DIAL falls 0/8
+
+# Gait styles: 4 gaits x 4 commands, 1500 steps, student only (a few minutes)
+python -m csm.gait.gait_verify_long2 \
+  csm_runs/gait-fit-d1/clouds-fit-20260915-115906/policy.pkl verify 0.15
+# expected: alive 4/4 for every gait, late pattern walk 0.28 / trot 0.83 /
+# pace 0.87 / bound 0.88
+```
+
+### Watch live
+
+The viewer streams MJPEG to `http://127.0.0.1:8084` (tunnel with
+`ssh -L 8084:127.0.0.1:8084` on a remote machine) with sliders for the
+preference weights and the command.
+
+```bash
+csm-live --example unitree_go2_push_recover \
+  --policy csm_runs/pr-v2-fit/clouds-fit-20260908-202201/policy.pkl
+csm-live --example unitree_go2_trot_csm --temperature 0.02 --level-scales 2.625 1.0 \
+  --policy csm_runs/clouds-fit-20260905-083613/policy.pkl
+csm-live --example unitree_go2_gait --temperature 0.15 --step-passes 6 \
+  --policy csm_runs/gait-fit-d1/clouds-fit-20260915-115906/policy.pkl
+```
 
 ## Compositional Energy Policy
 
