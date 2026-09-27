@@ -1,0 +1,180 @@
+<!--
+  A 7-DOF arm carrying a payload whose inertial and frictional properties are
+  the unknown parameters `theta = (m, c_x, c_y, c_z, mu)`.
+
+  Panda-like where it matters and not where it does not.  The kinematics, the
+  joint limits, the velocity limits and the torque limits are the real Franka
+  Panda numbers, because every one of those enters a cost term and therefore
+  decides which `theta` are hard.  The geometry is capsules rather than the
+  Franka meshes: the rollout budget for this study is on the order of 10^9
+  physics steps, a convex-hull collision pass on detailed meshes would dominate
+  it, and nothing in the question depends on the exact shell of link 4.
+
+  The payload hangs off the flange as its own body.  `body_mass` and
+  `body_ipos` of `payload` are overwritten per hypothesis at runtime -- that is
+  how `theta` enters the dynamics -- so the values here are only a nominal
+  midpoint for anything that loads the model directly.
+
+  Grasp friction `mu` does not appear in this file at all.  The payload is
+  rigidly attached, so there is no contact to give it to; slip is scored
+  analytically from the wrench the attachment has to carry (see the env).
+  Putting a real contact there would cost a solver iteration per step and add
+  a stochastic failure mode to a study that is about parameter uncertainty.
+-->
+<mujoco model="panda7_payload">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81"/>
+
+  <!-- The offscreen framebuffer the renderer draws into.  It defaults to
+       640x480 and a larger request fails at renderer construction, inside the
+       render thread, where a daemon thread dies quietly and the page shows a
+       control panel with no video. -->
+  <visual>
+    <global offwidth="1280" offheight="800"/>
+    <!-- The default headlight leaves this scene nearly black on a dark floor,
+         which made a floating payload hard to notice at all. -->
+    <headlight ambient="0.42 0.42 0.46" diffuse="0.55 0.55 0.55"
+               specular="0.12 0.12 0.12"/>
+    <map znear="0.02"/>
+  </visual>
+
+  <default>
+    <joint damping="0.5" armature="0.1" frictionloss="0.2"/>
+    <geom type="capsule" rgba="0.72 0.74 0.78 1" density="1200"
+          contype="0" conaffinity="0"/>
+    <default class="motor">
+      <!-- ctrlrange is the *commanded joint velocity* in rad/s; the env turns
+           it into a torque through a velocity PD and clips at the real
+           Franka torque limit, which is per joint and set below. -->
+      <general ctrllimited="true" forcelimited="true"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0.6 -1.2 2.2" dir="-0.2 0.45 -1" diffuse="0.95 0.95 0.92"
+           specular="0.2 0.2 0.2"/>
+    <light pos="-1.2 0.8 1.8" dir="0.5 -0.35 -1" diffuse="0.35 0.38 0.45"/>
+    <geom name="floor" type="plane" size="3 3 0.05" pos="0 0 0"
+          rgba="0.30 0.32 0.36 1" contype="0" conaffinity="0"/>
+    <!-- Where the payload is meant to end up.  A site rather than a body so it
+         has no mass, no collision and no effect on the dynamics. -->
+    <site name="goal" pos="0.346 -0.333 0.721" size="0.075" type="sphere"
+          rgba="0.30 0.85 0.50 0.30"/>
+    <!-- Where the payload starts, so the transport is legible in a still. -->
+    <site name="start" pos="0.05 -0.477 0.721" size="0.05" type="sphere"
+          rgba="0.55 0.60 0.70 0.18"/>
+    <camera name="view" pos="0.20 -2.30 1.30" xyaxes="1 0 0 0 0.292 0.956"/>
+    <body name="base" pos="0 0 0">
+      <geom name="g_base" fromto="0 0 0 0 0 0.12" size="0.07"/>
+
+      <body name="link1" pos="0 0 0.333">
+        <joint name="j1" axis="0 0 1" range="-2.8973 2.8973"/>
+        <geom name="g1" fromto="0 0 -0.19 0 0 0" size="0.055"/>
+
+        <body name="link2" pos="0 0 0">
+          <joint name="j2" axis="0 1 0" range="-1.7628 1.7628"/>
+          <geom name="g2" fromto="0 0 0 0 0 0.316" size="0.052"/>
+
+          <body name="link3" pos="0 0 0.316">
+            <joint name="j3" axis="0 0 1" range="-2.8973 2.8973"/>
+            <geom name="g3" fromto="0 0 0 0.0825 0 0" size="0.048"/>
+
+            <body name="link4" pos="0.0825 0 0">
+              <joint name="j4" axis="0 1 0" range="-3.0718 -0.0698"/>
+              <geom name="g4" fromto="0 0 0 -0.0825 0 0.384" size="0.046"/>
+
+              <body name="link5" pos="-0.0825 0 0.384">
+                <joint name="j5" axis="0 0 1" range="-2.8973 2.8973"/>
+                <geom name="g5" fromto="0 0 0 0 0 0.1" size="0.040"/>
+
+                <body name="link6" pos="0 0 0.1">
+                  <joint name="j6" axis="0 1 0" range="-0.0175 3.7525"/>
+                  <geom name="g6" fromto="0 0 0 0.088 0 0" size="0.038"/>
+
+                  <body name="link7" pos="0.088 0 0">
+                    <joint name="j7" axis="0 0 1" range="-2.8973 2.8973"/>
+                    <geom name="g7" fromto="0 0 0 0 0 0.07" size="0.034"/>
+
+                    <!-- The grasp frame.  `z` points along the approach
+                         direction, which is what separates the normal from the
+                         tangential part of the grasp wrench. -->
+                    <body name="grasp" pos="0 0 0.107">
+                      <site name="grasp_site" pos="0 0 0" size="0.010"
+                            rgba="0.94 0.71 0.16 1"/>
+
+                      <!-- The hand, and the handle it is closed on.  Both are
+                           part of the tool: the robot knows their mass, so
+                           they stay in the gravity-compensation model and the
+                           payload remains the only unknown. -->
+                      <geom name="g_hand" type="box" size="0.035 0.016 0.022"
+                            pos="0 0 0.012" mass="0.55"
+                            rgba="0.30 0.33 0.38 1"/>
+                      <geom name="g_fingerA" type="box" size="0.008 0.011 0.032"
+                            pos="0.020 0 0.062" mass="0.05"
+                            rgba="0.22 0.24 0.28 1"/>
+                      <geom name="g_fingerB" type="box" size="0.008 0.011 0.032"
+                            pos="-0.020 0 0.062" mass="0.05"
+                            rgba="0.22 0.24 0.28 1"/>
+                      <geom name="g_handle" type="capsule"
+                            fromto="0 0 0.030 0 0 0.155" size="0.011"
+                            mass="0.10" rgba="0.62 0.50 0.32 1"/>
+
+                      <!-- The payload's **visual** shell, fixed where it is
+                           held.  The unknown centre of mass lives in the
+                           `payload` body below, whose origin `theta` moves; the
+                           box must not move with it, because a held object does
+                           not shift in the hand when its contents are packed
+                           off-centre -- only its mass distribution does.  So
+                           the shell is drawn here, massless, and the point mass
+                           sits inside it. -->
+                      <geom name="g_payload" type="box" size="0.055 0.055 0.055"
+                            pos="0 0 0.20" mass="0"
+                            rgba="0.84 0.45 0.32 1"/>
+
+                      <!-- 0.20 m out, not 0.05.  At 0.05 the centre-of-mass
+                           offset does not reach the cost: +-0.06 m moves the
+                           wrist torque by about a newton-metre against a
+                           12 N*m limit, the torque row stays exactly zero for
+                           every hypothesis, and three of the five unknown
+                           parameters are invisible to the objective.  At
+                           0.20 m the lever from the wrist is 0.307 m, a 2.5 kg
+                           payload holds at 7.5 N*m of the 12 available, and a
+                           lateral offset tips it either way -- which is the
+                           axis along which two hypotheses can advise opposite
+                           corrections rather than the same one more strongly. -->
+                      <body name="payload" pos="0 0 0.20">
+                        <!-- mass and body_pos are overwritten per hypothesis;
+                             no geom, so nothing visible moves with the offset -->
+                        <inertial pos="0 0 0" mass="1.0"
+                                  diaginertia="0.004 0.004 0.004"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- Torque actuators.  `u` is a joint velocity command in [-1, 1] scaled by
+         the Franka velocity limit; the env forms the torque with a PD and
+         clips it here at the real per-joint torque limit, so a heavy payload
+         shows up as saturation rather than as an impossible command. -->
+    <motor class="motor" joint="j1" name="a1" ctrlrange="-87 87"  forcerange="-87 87"/>
+    <motor class="motor" joint="j2" name="a2" ctrlrange="-87 87"  forcerange="-87 87"/>
+    <motor class="motor" joint="j3" name="a3" ctrlrange="-87 87"  forcerange="-87 87"/>
+    <motor class="motor" joint="j4" name="a4" ctrlrange="-87 87"  forcerange="-87 87"/>
+    <motor class="motor" joint="j5" name="a5" ctrlrange="-12 12"  forcerange="-12 12"/>
+    <motor class="motor" joint="j6" name="a6" ctrlrange="-12 12"  forcerange="-12 12"/>
+    <motor class="motor" joint="j7" name="a7" ctrlrange="-12 12"  forcerange="-12 12"/>
+  </actuator>
+
+  <keyframe>
+    <!-- A reachable carrying pose: elbow down, payload roughly level. -->
+    <key name="carry" qpos="0 -0.6 0 -2.0 0 1.6 0.8"/>
+  </keyframe>
+</mujoco>
