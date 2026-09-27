@@ -54,6 +54,7 @@ def make_pass(
     std_normalize: bool = False,
     student: Callable | None = None,
     level_scales=None,
+    project: Callable | None = None,
 ):
     """One annealing pass over every level, batched across environments.
 
@@ -61,6 +62,12 @@ def make_pass(
     and the clouds visited on the way.  `student`, when given, takes
     `(plan, obs, t, omega)` and replaces the teacher as the thing that advances
     the plan -- the labels still come from DIAL either way.
+
+    `project`, when given, maps `(plan, state)` to the plan the driver may
+    actually hold -- a runtime constraint composed into the plan after every
+    level.  Only the driven plan moves; the queries and their clouds stay
+    unconstrained, because the fields learn the rows' own scores and the
+    constraint is composed analytically at run time.
     """
 
     sample = make_sampler(mbdpi, dial_config)
@@ -122,6 +129,8 @@ def make_pass(
             )
 
         new_plan = jnp.clip(plan + drive, -1.0, 1.0)
+        if project is not None:
+            new_plan = project(new_plan, state)
         record = {"u": queries, "terms": terms, "sample_rng": keys,
                   "noise": jnp.broadcast_to(noise, (n_query,) + noise.shape),
                   "factor": jnp.full((n_query,), factor)}
@@ -336,6 +345,7 @@ def collect(
     student: Callable | None = None,
     mix_basis_rows: float = 0.5,
     progress: bool = True,
+    project: Callable | None = None,
 ):
     """Run `num_steps` synchronized control steps across `num_envs` copies.
 
@@ -347,7 +357,7 @@ def collect(
 
     run_pass, num_levels, n_query = make_pass(
         env, mbdpi, dial_config, perturb_scales, repeats,
-        temperature, std_normalize, student, level_scales,
+        temperature, std_normalize, student, level_scales, project,
     )
     disturb = make_disturber(
         push_interval, push_probability, push_speed_min, push_speed_max

@@ -63,6 +63,10 @@ def main() -> None:
     parser.add_argument("--student-policy", type=Path, default=None,
                         help="composed policy that drives collection (DAgger); "
                              "labels still come from DIAL either way")
+    parser.add_argument("--band-family", action="store_true",
+                        help="drive every episode under a random single-joint "
+                             "band (csm.constraint_compose), composed into the "
+                             "driven plan; the labels stay unconstrained")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -71,6 +75,12 @@ def main() -> None:
 
     dial_config = dataclasses.replace(dial_config, temp_sample=args.temperature)
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
+    project = None
+    if args.band_family:
+        from csm.constraint_compose import BandEnv, project_to_band
+        env = BandEnv(env)
+        project = project_to_band
+        print("[collect] driving under the random single-joint band family")
     mbdpi = make_controller(dial_config, env)
 
     n_rows = int(np.asarray(env_config.reward_weights).shape[0])
@@ -117,6 +127,7 @@ def main() -> None:
         push_speed_min=args.push_speed_min, push_speed_max=args.push_speed_max,
         mix_basis_rows=args.mix_basis_rows, student=student,
         shard_dir=out, shard_every=args.shard_every, progress=True,
+        project=project,
     )
     elapsed = time.time() - started
 
@@ -128,6 +139,7 @@ def main() -> None:
         "level_scales": args.level_scales,
         "perturb_scales": args.perturb_scales,
         "std_normalize": False,
+        "band_family": bool(args.band_family),
         "student_policy": (None if args.student_policy is None
                            else str(args.student_policy)),
         "nsample": dial_config.Nsample + 1,
