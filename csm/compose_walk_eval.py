@@ -37,7 +37,7 @@ from csm.basis_screen import _load_config, build_omegas
 from csm.dial_lean import make_dial_step, make_lean_update, mppi_logits
 from csm.dial_score import ComposedDialScorePolicy, factor_to_t
 from csm.omega import mixture_from_pinv, normalize_omega_np
-from csm.rl_baseline import load_policy as load_rl_policy
+from csm.rl_baseline import gait_clock, load_policy as load_rl_policy
 from csm.screen import COMMANDS, set_command, set_omega
 from csm.teacher_cache import (DEFAULT_ROOT, TeacherCache, episode_key,
                                fingerprint)
@@ -176,7 +176,7 @@ def make_teacher(env, mbdpi, dial_config, init_passes, std_normalize,
 
 
 def make_rl_student(env, inference, n_steps, record=_reward_done,
-                    append_omega=False):
+                    append_omega=False, clock_cadence=None):
     """A trained-at-one-weight RL policy, run through the same loop.
 
     Signature-compatible with `make_student` so the scoring path, the cached
@@ -189,6 +189,9 @@ def make_rl_student(env, inference, n_steps, record=_reward_done,
     `--condition-omega`.  That one does have a weight input, so the target is
     appended to the observation exactly as its training wrapper did, and it can
     be scored across the whole target list like the composed student.
+
+    `clock_cadence` rebuilds the gait clock a policy trained with `--clock`
+    saw, appended after omega exactly as `rl_baseline.build_env` orders it.
     """
 
     @jax.jit
@@ -197,6 +200,9 @@ def make_rl_student(env, inference, n_steps, record=_reward_done,
             st, key = carry
             key, sub = jax.random.split(key)
             obs = jnp.concatenate([st.obs, omega]) if append_omega else st.obs
+            if clock_cadence is not None:
+                obs = jnp.concatenate(
+                    [obs, gait_clock(st.info["step"], env.dt, clock_cadence)])
             action, _ = inference(obs, sub)
             st = env.step(st, action)
             return (st, key), record(st)
@@ -424,7 +430,8 @@ def main() -> None:
     elif inference is not None:
         student = make_rl_student(
             env, inference, args.steps,
-            append_omega=bool(blob.get("omega_conditioned")))
+            append_omega=bool(blob.get("omega_conditioned")),
+            clock_cadence=blob.get("clock_cadence"))
     else:
         if args.conditioned and len(policy.policies) != 1:
             raise ValueError(

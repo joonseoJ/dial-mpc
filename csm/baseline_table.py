@@ -8,11 +8,14 @@ NAMES = ["uniform", "boost0", "boost1", "boost2", "2,1,1", "1,2,1", "1,1,2", "3,
 SLUGS = ["uniform", "boost0", "boost1", "boost2", "211", "121", "112", "312"]
 H = sys.argv[1] if len(sys.argv) > 1 else "1500"
 suffix = "" if H == "1500" else "_150"
+# Which PPO sweep to read: rl-sweep (no gait clock, the original table) or
+# rl-sweep-clock (the clock appended -- the fair baseline).
+SWEEP = sys.argv[2] if len(sys.argv) > 2 else "rl-sweep"
 
 csm = json.load(open(f"csm_runs/walk_screen/compose_v5_cached{suffix}.json"))
 ppo = {}
 for name, slug in zip(NAMES, SLUGS):
-    p = Path(f"csm_runs/rl-sweep/{slug}_eval{suffix}.json")
+    p = Path(f"csm_runs/{SWEEP}/{slug}_eval{suffix}.json")
     if not p.exists():
         continue
     d = json.load(open(p))
@@ -23,7 +26,7 @@ for name, slug in zip(NAMES, SLUGS):
     tag = key.pop()
     ppo[name] = {c: d[f"{c}/{tag}"] for c in CMDS if f"{c}/{tag}" in d}
 
-print(f"cost ratio against DIAL, {H} steps  (1.00 = matches its teacher)\n")
+print(f"cost ratio against DIAL, {H} steps  (1.00 = matches its teacher)  PPO from {SWEEP}\n")
 head = f"{'weight':<9}" + "".join(f"{c.replace('box_',''):>17}" for c in CMDS)
 print(head); print(f"{'':<9}" + "".join(f"{'CSM':>8}{'PPO':>9}" for _ in CMDS))
 print("-" * len(head))

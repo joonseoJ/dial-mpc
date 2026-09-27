@@ -121,6 +121,52 @@ class OmegaConditionedWrapper(Wrapper):
         return self._augment(self.env.step(state, action))
 
 
+class GaitClockWrapper(Wrapper):
+    """Append the gait clock (sin, cos of the schedule's phase) to the observation.
+
+    The walking objective's gait row tracks a foot-height schedule indexed by
+    time, `get_foot_step(..., info["step"] * dt)`, and `_get_obs` carries no
+    clock.  DIAL reads the step inside its rollouts and a CSM student carries the
+    phase in its warm-started plan, but a reactive policy has no way to know it,
+    so without this the baseline is scored on a row it cannot observe.  Every
+    legged-RL setup feeds such a clock; `unitree_go2_gait` already does.
+    Measured at boost2: cost ratio 2.68 without it, 0.117 with it.
+
+    The phase is `2 pi cadence t`, the argument `get_foot_step` builds its own
+    angle from; one clock covers all four feet because the per-foot offsets are
+    constants of the gait.
+    """
+
+    def __init__(self, env, cadence: float):
+        super().__init__(env)
+        self._cadence = float(cadence)
+
+    @property
+    def observation_size(self) -> int:
+        return int(self.env.observation_size) + 2
+
+    def _augment(self, state: State) -> State:
+        return state.replace(obs=jnp.concatenate(
+            [state.obs, gait_clock(state.info["step"], self.dt, self._cadence)]))
+
+    def reset(self, rng: jax.Array) -> State:
+        return self._augment(self.env.reset(rng))
+
+    def step(self, state: State, action: jax.Array) -> State:
+        return self._augment(self.env.step(state, action))
+
+
+def gait_clock(step, dt, cadence):
+    phi = 2.0 * jnp.pi * cadence * step * dt
+    return jnp.stack([jnp.sin(phi), jnp.cos(phi)])
+
+
+def gait_cadence(env) -> float:
+    """The cadence the environment's gait row runs at."""
+
+    return float(np.asarray(env._gait_params[env._gait])[1])
+
+
 def resolve_omega(text: str, n_rows: int) -> np.ndarray:
     catalogue = build_omegas(n_rows)
     if text in catalogue:
@@ -129,7 +175,8 @@ def resolve_omega(text: str, n_rows: int) -> np.ndarray:
 
 
 def build_env(example: str, omega, *, terminate: bool, randomize_start: bool,
-              row_scales=None, condition_omega: bool = False):
+              row_scales=None, condition_omega: bool = False,
+              clock: bool = False):
     dial_config, env_config = _load_config(example, None)
     if row_scales:
         env_config = dataclasses.replace(
@@ -159,6 +206,10 @@ def build_env(example: str, omega, *, terminate: bool, randomize_start: bool,
     if condition_omega:
         n_rows = int(np.asarray(env_config.reward_weights).shape[0])
         env = OmegaConditionedWrapper(env, n_rows)
+    # Observation order: [env obs, omega (conditioned), clock].  The evaluation
+    # rebuilds it in the same order from what `save_policy` records.
+    if clock:
+        env = GaitClockWrapper(env, gait_cadence(env.unwrapped))
     return env, dial_config, env_config
 
 
@@ -243,7 +294,7 @@ def train(args, env):
 
 def save_policy(path: Path, *, algo, hidden, params, obs_size, act_size,
                 omega, omega_name=None, temperature=None,
-                omega_conditioned=False, n_rows=None):
+                omega_conditioned=False, n_rows=None, clock_cadence=None):
     """Enough to rebuild the deterministic policy without the trainer.
 
     The parameters alone are not a policy: the observation normaliser's
@@ -266,6 +317,8 @@ def save_policy(path: Path, *, algo, hidden, params, obs_size, act_size,
             "omega_conditioned": bool(omega_conditioned),
             "n_rows": None if n_rows is None else int(n_rows),
             "temperature": temperature,
+            # Present only for a policy trained with the gait clock appended.
+            "clock_cadence": None if clock_cadence is None else float(clock_cadence),
         }, handle)
 
 
@@ -311,6 +364,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--terminate", action="store_true",
                    help="keep the environment's fall termination; the naive "
                         "setup, in which falling is the optimal policy")
+    p.add_argument("--clock", action="store_true",
+                   help="append the gait clock to the observation; without it "
+                        "the walking gait row is unobservable to a reactive "
+                        "policy")
     p.add_argument("--randomize-start", action="store_true",
                    help="widen the reset distribution.  Leaves the objective "
                         "alone, so the steelman arm may use it")
@@ -356,7 +413,7 @@ def main() -> None:
     env, dial_config, env_config = build_env(
         args.example, omega, terminate=args.terminate,
         randomize_start=args.randomize_start, row_scales=args.row_scales,
-        condition_omega=args.condition_omega)
+        condition_omega=args.condition_omega, clock=args.clock)
 
     print(f"env {dial_config.env_name}  algo {args.algo}  "
           f"omega {args.omega} = {np.round(omega, 4).tolist()}")
@@ -375,13 +432,15 @@ def main() -> None:
                 params=params, obs_size=env.observation_size,
                 act_size=env.action_size, omega=omega,
                 omega_name=None if args.condition_omega else args.omega,
-                omega_conditioned=args.condition_omega, n_rows=n_rows)
+                omega_conditioned=args.condition_omega, n_rows=n_rows,
+                clock_cadence=(gait_cadence(env.unwrapped) if args.clock else None))
     report = {
         "algo": args.algo, "omega_name": args.omega,
         "omega": np.asarray(omega, dtype=float).tolist(),
         "example": args.example,
         "terminate": bool(args.terminate),
         "randomize_start": bool(args.randomize_start),
+        "clock": bool(args.clock),
         "row_scales": [float(env_config.track_scale),
                        float(env_config.stability_scale),
                        float(env_config.gait_scale)],
