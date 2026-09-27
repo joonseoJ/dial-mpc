@@ -270,3 +270,4 @@ dial_mpc_ws/
 
 # W&B local run cache; the runs live on the server.
 /wandb/
+hf_upload/

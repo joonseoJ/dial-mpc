@@ -170,6 +170,22 @@ csm-live --example unitree_go2_gait --temperature 0.15 --step-passes 6 \
   --policy csm_runs/gait-fit-d1/clouds-fit-20260915-115906/policy.pkl
 ```
 
+### Training data
+
+The sample clouds the three models were fitted from (138 GB) are a public
+Hugging Face dataset,
+[`joonseo-jang/dial-mpc-csm-clouds`](https://huggingface.co/datasets/joonseo-jang/dial-mpc-csm-clouds):
+`pr_collect_v2` (push recovery), `walk_collect_v5` (walking), `gait_v2` +
+`gait_d1` (gait styles).  Download into `csm_runs/` to refit or relabel
+without simulating anything:
+
+```bash
+hf download joonseo-jang/dial-mpc-csm-clouds --repo-type dataset --local-dir csm_runs
+# or one task only
+hf download joonseo-jang/dial-mpc-csm-clouds --repo-type dataset --local-dir csm_runs \
+  --include "walk_collect_v5/*"
+```
+
 ## Compositional Energy Policy
 
 The bundled `csm` package trains one scalar trajectory-energy head for each
